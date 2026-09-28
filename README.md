@@ -10,29 +10,49 @@ This app provides a GUI workflow for:
 
 ## Launch
 
-First create the Conda environment using the [repository setup guide](../README.md#setup-with-conda).
-Then, from the project root:
+The interface uses Qt and PyQtGraph. Install dependencies in your Python environment, then launch from this directory:
 
 ```bash
-conda activate protein-data-analysis
-python filtering_app/main.py
+python -m pip install -r requirements.txt
+python main.py
 ```
 
-## Input File
+You can also open a recording immediately:
 
-The app expects an H5 file with an `events` group.
+```bash
+python main.py "/path/to/recording.h5"
+```
 
-- The first event is treated as the synthetic start event and is excluded from preview and filtering.
-- Each later event is scanned for one or more segments.
+`requirements.txt` installs PySide6. An existing environment with PyQtGraph and PyQt5/PyQt6 also works through PyQtGraph's Qt compatibility layer. Tkinter and Matplotlib are no longer used.
 
-## Main Window
+## Input and voltage selection
 
-The main window contains:
+Drag one `.h5` or `.hdf5` event file from Finder anywhere onto the app (including the path field and plots), use **Browse**, or paste its path. Local file URLs and paths containing spaces are supported. Loading runs in the background and immediately displays unprocessed event traces, before segment detection. Use **Previous** and **Next** to browse six raw events at a time.
 
-- H5 file selector
-- thresholding parameters
-- 12 preview traces
-- histograms of current segment metrics
+The input must contain an `events` group of one-dimensional current datasets. Dataset names are sorted in numeric event order. The first dataset is treated as the synthetic start event and excluded from previews and analysis.
+
+The app looks beside the input for a matching `<recording>_AO.h5` or `.hdf5` file (case-insensitive). Its `data` dataset must have `timestamp` and `ao_value` fields, as in `H5Splitter_volt.py`:
+
+- AO timestamps are milliseconds; event `timestamp` attributes are seconds.
+- Each event receives the last AO value at or before its timestamp, rounded to 1 mV. Before the first AO entry, the splitter convention is 0 V.
+- Voltage grouping happens in memory; loading a recording creates no new files.
+- **Save selected voltages…** lets you choose a destination folder and writes one H5 per checked voltage, with the synthetic start event, reindexed event names, source names, timestamps, and original metadata.
+- Existing split files are preserved; repeated saves get numbered output filenames. Saving uses the recorded AO groups even when manual voltage is enabled for resistance calculations.
+- Check the voltages to include in raw browsing and downstream analysis. All are initially checked. Resistance uses each event's assigned voltage.
+- **Use manual voltage** overrides the AO-derived voltage for resistance calculations; voltage checkboxes still determine which events to include.
+
+If no matching AO file is found, a message explains this and the manual voltage field is enabled. An invalid/empty AO log or missing event timestamps also falls back to manual voltage. If an explicit voltage save fails, the message explains the failure and voltage selection remains available in memory. The input recording is never modified.
+
+## Main window
+
+A scrollable panel down the left contains file loading, voltage selection, detection settings, and actions. Sampling frequency and buffer duration are in the file/acquisition section. The filtering and vibration windows also have controls down their left sides. The right side contains raw event previews and four pairs of plots:
+
+- dwell time: histogram and event-time plot
+- EC: histogram and event-time plot
+- relative ΔI: histogram and event-time plot
+- resistance: histogram and event-time plot
+
+Segment metrics remain empty until **Analyze selected voltages** or **Preview segments…** runs detection. Changing detection settings or selected voltages clears previous results so filtering cannot use stale settings. The raw traces remain unprocessed.
 
 ### Parameters
 
@@ -72,7 +92,7 @@ A segment is treated as a duplicate if it has exactly the same:
 - EC
 - relative delta I
 
-as a segment in the previous or following event.
+as a segment in the previous or following event. Comparisons use original event adjacency and do not cross different assigned voltages.
 
 When duplicates are found, the app keeps the copy that is furthest from the beginning and end of its event file. This favors the least edge-clipped segment.
 
@@ -84,48 +104,37 @@ Duplicate segments are removed before they enter:
 - CSV saving
 - filtered H5 saving
 
-## Preview Window Workflow
+## Analysis and segment previews
 
-1. Choose the H5 file.
-2. Enter the thresholding parameters.
-3. Click `Load / Reload Preview`.
+1. Drop or choose the event H5 file and inspect its raw traces.
+2. Select voltage groups, or enter a manual voltage when no AO log is available.
+3. Adjust detection settings, then click **Analyze selected voltages**.
+4. Inspect the four histograms and the matching plots against event time.
+5. Click **Preview segments…** to open a separate window of up to 12 example events, including events without detected segments. This button also runs analysis first if needed.
 
-This will:
+The segment window highlights accepted segments, draws baseline and threshold guides, and labels dwell times. It stays open and updates when vibration removal is confirmed or detection is rerun. Preview controls live in the main window’s left **Event previews** panel; the example window contains only plots. Analysis and vibration evaluation run in worker threads so plots remain responsive.
 
-- detect segments in all events
-- remove adjacent duplicates
-- build the working list
-- display 12 example traces and 4 histograms
+### Linked browsing
 
-### Preview Controls
+- Click points on any metric-versus-time plot, or drag a selection rectangle, to show those events in the raw preview and the open example window. Shift, Command, or Control adds to an existing time-plot selection.
+- Previewed events have larger, lighter dots in every time plot. Multiple segments from the same event share that preview highlight.
+- **Preview order**, in the left **Event previews** panel, switches between chronological order (by event timestamp) and random order. This setting drives both preview windows. **Previous** and **Next** browse more events; **All events** clears the time-plot restriction within the checked voltages.
+- Selecting segments in the filtering window changes only which segments are highlighted in the example window. It does not remove events from the preview population. Events without detected or selected segments remain available and show their full raw traces.
+- Opening the filtering window starts with no selected segments. **Select all in range** highlights every detected segment within the time interval in the displayed examples.
 
-- `Load / Reload Preview`: reruns detection using the current settings
-- `Show Another Random 12`: shows a different random subset from the current working list without recomputing everything
-- `Vibration Removal`: opens the vibration-removal window
-- `Confirm Threshold`: opens the scatter-based segment filtering window
+**Analyze selected voltages** always reruns detection, resetting any earlier vibration removal. **Preview segments…** reuses the current working results when the settings are unchanged.
 
-### Trace Display
+### Histograms and event time
 
-Each preview trace shows:
+Histograms are horizontal: count is on x and the physical parameter is on y. Each histogram shares its y range and parameter color with the adjacent time plot. The count axis is pinned at zero: panning cannot move its origin, while zooming changes the upper limit. Histogram and time-plot titles are hidden; axis labels identify each metric. The four parameters use distinct bright colors, and scatter points are translucent.
 
-- the full saved event record
-- highlighted detected segments
-- segment-specific baseline and threshold guides
-- dwell times overlaid on the plot
-- `no event` if no valid segment remains in that event
+Histograms show the central 99% of finite values, trimming up to 0.5% from each tail using observed ranks. Small samples and ties may retain more than 99%. Constant-valued data gets a padded range. Adaptive bin counts are capped at 120. Each histogram’s tooltip reports how many values are outside its initial displayed range.
 
-### Histograms
-
-The histograms summarize the current working list using adaptive binning:
-
-- `Dwell t (ms)`
-- `EC (nA ms)`
-- `rel delta I`
-- `R (MOhm)`
+These display limits do not remove segments or change selection/export data. Time plots retain all finite metric values with valid timestamps and share the time axis. Each histogram/time pair initially uses the central-99% value range; pan or zoom the shared y axis to inspect time-plot outliers. The x coordinate is the event timestamp minus the synthetic start timestamp (or the earliest available timestamp if the start timestamp is missing), in seconds. Events without timestamps remain in the full histograms; time-plot tooltips report their omitted count.
 
 ## Vibration Removal
 
-Click `Vibration Removal` to open a second window that removes segments with no accepted standard-deviation peak.
+Click **Vibration removal…** to open a second window that removes segments with no accepted standard-deviation peak.
 
 The vibration window includes these parameters:
 
@@ -139,14 +148,14 @@ The vibration window includes these parameters:
 1. Adjust the std parameters.
 2. Click `Preview Removal`.
 3. Review the removed segments shown in the window.
-4. Optionally click `Show Another Random 12` to inspect another subset of removed segments.
+4. Optionally click **Randomise examples** to inspect another subset of removed segments.
 5. Click `Confirm` to keep the vibration-filtered working list.
 
-If the vibration-removal window is closed without confirming, the previous working list is restored.
+Vibration previews are tentative. Only **Confirm** changes the working list; closing the window leaves it unchanged. Changing vibration parameters requires a new preview before confirming.
 
 ## Scatter-Based Segment Filtering
 
-Click `Confirm Threshold` in the main window to open the scatter-filter stage.
+Click **Filter / save segments…** in the main window to open the scatter-filter stage.
 
 This stage shows linked scatter plots of:
 
@@ -156,6 +165,16 @@ This stage shows linked scatter plots of:
 - resistance vs dwell time
 
 It also shows the currently selected segment trace below the scatter plots.
+
+### Event time range
+
+The left panel has a two-handle **Event time range** slider and precise **From**/**To** inputs, in seconds since recording start. Drag either handle or the shaded interval to change the window. Clicks, box selection, and **Select all in range** select only segments whose event timestamps fall inside the inclusive interval. Narrowing the interval removes existing selections outside it; widening it does not automatically add selections. **Full time range** resets the interval. Out-of-range points are faded further.
+
+When some timestamps are missing, those segments cannot be selected within the time range. If no timestamps are available, the range control is disabled and selection remains available without a time restriction.
+
+### Main-plot selection overlays
+
+While segment filtering is open, the main histograms and time points show the full dataset in gray. Selected segments are overlaid in each parameter’s original bright color. Selected histograms use exactly the same bins as the full histogram, and selecting points does not reset the plot ranges. In time plots, only selected segment points regain their parameter color; previewed selected points retain their lighter shade. Closing the filtering window restores the normal full-data colors.
 
 ### Selection
 
@@ -171,7 +190,7 @@ The box selector supports two modes:
 - `Add`: add enclosed points to the current selection
 - `Remove`: remove enclosed points from the current selection
 
-The Matplotlib toolbar supports zoom, pan, and reset.
+Choose **Pan** to pan instead of selecting. Scroll to zoom, use the PyQtGraph context menu for plot options, or click **Reset view**. **Select all in range** includes all results inside the current event-time interval, including metric outliers.
 
 ## Saving
 
@@ -194,16 +213,15 @@ The saved CSV includes:
 - `delta_I_nA`
 - `delta_I_rel`
 - `resistance_MOhm`
+- `voltage_mV`
 
-## Typical Workflow
+The filtered H5 contains the synthetic start event and one full source trace per selected segment. Datasets are reindexed and preserve original attributes, source event/segment names, segment bounds, metrics, and applied voltage. Selecting the input file as the export destination is rejected.
 
-1. Launch the app.
-2. Choose the H5 file.
-3. Set thresholding parameters.
-4. Click `Load / Reload Preview`.
-5. Inspect the preview traces and histograms.
-6. Adjust thresholding settings if needed and reload.
-7. Optionally run `Vibration Removal` and confirm the result.
-8. Click `Confirm Threshold`.
-9. Select the desired segment population in the scatter plots.
-10. Save the selected CSV and/or filtered H5.
+## Verification
+
+Run the synthetic-file and offscreen Qt integration tests with:
+
+```bash
+python -m pip install pytest
+QT_QPA_PLATFORM=offscreen python -m pytest -q tests
+```

@@ -1,463 +1,307 @@
 from __future__ import annotations
 
+import csv
 import os
-import tkinter as tk
-from dataclasses import dataclass
-from tkinter import filedialog, messagebox, ttk
+import tempfile
+from dataclasses import asdict
+from pathlib import Path
 
 import h5py
-import matplotlib
-matplotlib.use("TkAgg")
 import numpy as np
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
-from matplotlib.figure import Figure
-from matplotlib.widgets import RectangleSelector
+import pyqtgraph as pg
+from pyqtgraph.Qt import QtCore, QtWidgets
 
-from .dwell_t import (
-    DetectedEvent,
-    SegmentResult,
-    Settings,
-    get_segment_end_std_overlay,
-    threshold_guide_value,
-)
+from .H5Splitter_1000 import list_events
+from .dwell_t import EventPreview
+from .plots import SelectionViewBox, draw_trace, scatter_brush, style_plot
+from .qt_helpers import button, number_field
 
 
-BG_COLOR = "#f5f7fb"
-PANEL_COLOR = "#ffffff"
-FIELD_COLOR = "#ffffff"
-TEXT_COLOR = "#18212b"
-MUTED_COLOR = "#5f6b7a"
-TRACE_COLOR = "#4a5564"
-POS_COLOR = "#ef6c63"
-NEG_COLOR = "#4a9eff"
-SELECT_EDGE = "#18212b"
+def write_selected_csv(path, rows):
+    if not rows:
+        raise ValueError('No segments selected.')
+    with open(path, 'w', newline='') as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(asdict(rows[0])))
+        writer.writeheader()
+        writer.writerows(asdict(row) for row in rows)
 
 
-@dataclass
-class SegmentTrace:
-    result: SegmentResult
-    data: np.ndarray
-    baseline: float
+def write_selected_h5(path, settings, rows, base_event_names):
+    if Path(path).resolve() == Path(settings.filepath).resolve():
+        raise ValueError('Choose a different filename; the input file cannot be overwritten.')
+    if not rows:
+        raise ValueError('No segments selected.')
+    # Build beside the destination and publish only after the complete export succeeds.
+    descriptor, temporary = tempfile.mkstemp(prefix='.filtered-', suffix='.h5', dir=Path(path).parent)
+    os.close(descriptor)
+    try:
+        with h5py.File(settings.filepath, 'r') as src, h5py.File(temporary, 'w') as dst:
+            for key, value in src.attrs.items():
+                dst.attrs[key] = value
+            dst.attrs['source_file'] = settings.filepath
+            events = dst.create_group('events', track_order=True)
+            for key, value in src['events'].attrs.items():
+                events.attrs[key] = value
+            names = list_events(src['events'])
+            if names:
+                src.copy(src['events'][names[0]], events, name='event_00000')
+            for index, row in enumerate(rows, start=1):
+                name = base_event_names[row.event_name]
+                output_name = f'event_{index:05d}'
+                src.copy(src['events'][name], events, name=output_name)
+                dataset = events[output_name]
+                dataset.attrs['source_event_name'] = name
+                dataset.attrs['source_segment_name'] = row.event_name
+                for key, value in asdict(row).items():
+                    if value is not None and key != 'event_name':
+                        dataset.attrs[key] = value
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
-class FilteringToolbar(NavigationToolbar2Tk):
-    toolitems = tuple(item for item in NavigationToolbar2Tk.toolitems if item[0] != "Subplots")
+class EventTimeRange(QtWidgets.QGroupBox):
+    rangeChanged = QtCore.Signal(float, float)
+
+    def __init__(self, times):
+        super().__init__('Event time range')
+        layout = QtWidgets.QVBoxLayout(self)
+        finite = times[np.isfinite(times)]
+        self.available = bool(finite.size)
+        self.bounds = (float(finite.min()), float(finite.max())) if self.available else (0.0, 1.0)
+        lo, hi = self.bounds
+        self.slider = pg.PlotWidget()
+        self.slider.setFixedHeight(100)
+        self.slider.setMouseEnabled(x=False, y=False)
+        self.slider.setMenuEnabled(False)
+        self.slider.hideButtons()
+        self.slider.hideAxis('left')
+        self.slider.setLabel('bottom', 'Event time (s)')
+        self.slider.setToolTip('Seconds since recording start; drag either handle or move the whole interval.')
+        self.slider.setYRange(0, 1, padding=0)
+        pad = max((hi - lo) * 0.04, 0.001)
+        self.slider.setXRange(lo - pad, hi + pad, padding=0)
+        self.slider.plot([lo, hi], [0.5, 0.5], pen=pg.mkPen('#abb8c5', width=2))
+        self.region = pg.LinearRegionItem(values=(lo, hi), bounds=self.bounds,
+                                         brush=pg.mkBrush(20, 155, 255, 45), pen=pg.mkPen('#149bff', width=2))
+        self.slider.addItem(self.region)
+        layout.addWidget(self.slider)
+        form = QtWidgets.QFormLayout()
+        self.start = number_field(lo, minimum=lo, maximum=hi, decimals=6)
+        self.end = number_field(hi, minimum=lo, maximum=hi, decimals=6)
+        for field in (self.start, self.end):
+            field.setMaximumWidth(16777215)
+            field.setSingleStep(max((hi - lo) / 100, 0.001))
+        form.addRow('From (s)', self.start)
+        form.addRow('To (s)', self.end)
+        layout.addLayout(form)
+        self.reset_button = button('Full time range', lambda: self.region.setRegion(self.bounds), layout)
+        self.start.valueChanged.connect(lambda value: self.region.setRegion((min(value, self.region.getRegion()[1]), self.region.getRegion()[1])))
+        self.end.valueChanged.connect(lambda value: self.region.setRegion((self.region.getRegion()[0], max(value, self.region.getRegion()[0]))))
+        self.region.sigRegionChanged.connect(self._changed)
+        if not self.available:
+            layout.addWidget(QtWidgets.QLabel('No timestamps: range unavailable.'))
+            self.setEnabled(False)
+
+    def _changed(self):
+        lo, hi = self.region.getRegion()
+        for field, value in ((self.start, lo), (self.end, hi)):
+            field.blockSignals(True)
+            field.setValue(value)
+            field.blockSignals(False)
+        self.rangeChanged.emit(lo, hi)
+
+    def contains(self, times):
+        if not self.available:
+            return np.ones(len(times), dtype=bool)
+        lo, hi = self.region.getRegion()
+        return np.isfinite(times) & (times >= lo) & (times <= hi)
 
 
-class SegmentFilterWindow:
-    def __init__(
-        self,
-        parent,
-        settings: Settings,
-        detected_events: list[DetectedEvent],
-        segment_results: list[SegmentResult],
-    ) -> None:
-        self.parent = parent
+class SegmentFilterWindow(QtWidgets.QDialog):
+    selectionChanged = QtCore.Signal(object)
+
+    def __init__(self, parent, settings, detected_events, segment_results, time_origin=None):
+        super().__init__(parent)
         self.settings = settings
         self.detected_events = detected_events
         self.segment_results = segment_results
-        self.selected_indices: set[int] = set()
-        self.last_selected_index: int | None = None
-        self.selectors = []
-        self.collections = []
-        self.segment_traces = self._load_segment_traces()
-        self.index_by_name = {row.event_name: idx for idx, row in enumerate(self.segment_results)}
-        self.box_select_mode = tk.StringVar(value="add")
-        self.base_event_names: dict[str, str] = {}
+        timestamps = np.array([row.timestamp if row.timestamp is not None else np.nan for row in segment_results], dtype=float)
+        finite = timestamps[np.isfinite(timestamps)]
+        if time_origin is None:
+            source = getattr(parent, 'source', None)
+            time_origin = source.time_origin if source else (float(finite.min()) if finite.size else 0.0)
+        self.event_times = timestamps - time_origin
+        self.selected_indices = set()
+        self.last_selected_index = None
+        self.base_event_names = {}
         self.segment_infos = {}
-        for event in self.detected_events:
-            for seg_idx, segment in enumerate(event.segments):
-                seg_name = event.event_name if seg_idx == 0 else f"{event.event_name}_{seg_idx}"
-                self.base_event_names[seg_name] = event.event_name
-                self.segment_infos[seg_name] = segment
-
-        self.window = tk.Toplevel(parent)
-        self.window.title("Segment Filtering")
-        self.window.geometry("1550x980")
-        self.window.configure(bg=BG_COLOR)
-
-        self.status_var = tk.StringVar(value=f"{len(self.segment_results)} segments loaded. Select points to keep.")
-        self.scatter_axes = {}
-        self.ax_trace = None
-
-        self._build_ui()
-        self.render()
-
-    def _build_ui(self) -> None:
-        controls = ttk.Frame(self.window, padding=12)
-        controls.pack(side=tk.TOP, fill=tk.X)
-
-        ttk.Button(controls, text="Clear Selection", command=self.clear_selection).grid(row=0, column=0, padx=(0, 8))
-        ttk.Button(controls, text="Save Selected CSV", command=self.save_selected_csv).grid(row=0, column=1, padx=(0, 8))
-        ttk.Button(controls, text="Save Selected H5", command=self.save_selected_h5).grid(row=0, column=2, padx=(0, 8))
-        ttk.Label(controls, text="Box mode").grid(row=0, column=3, padx=(16, 6))
-        ttk.Radiobutton(controls, text="Add", variable=self.box_select_mode, value="add").grid(row=0, column=4, padx=(0, 6))
-        ttk.Radiobutton(controls, text="Remove", variable=self.box_select_mode, value="remove").grid(row=0, column=5, padx=(0, 6))
-
-        ttk.Label(self.window, textvariable=self.status_var, padding=(12, 0, 12, 8)).pack(side=tk.TOP, fill=tk.X)
-
-        self.figure = Figure(figsize=(15.2, 9.5), dpi=100, facecolor=BG_COLOR)
-        self.canvas = FigureCanvasTkAgg(self.figure, master=self.window)
-
-        toolbar_frame = tk.Frame(self.window, bg="#e8edf5", padx=6, pady=4)
-        toolbar_frame.pack(side=tk.TOP, fill=tk.X)
-        self.toolbar = FilteringToolbar(self.canvas, toolbar_frame, pack_toolbar=False)
-        self.toolbar.update()
-        self.toolbar.config(background="#e8edf5", borderwidth=0)
-        self.toolbar._message_label.configure(background="#e8edf5", foreground=TEXT_COLOR)
-        for child in self.toolbar.winfo_children():
-            widget_class = child.winfo_class()
-            if widget_class == "Frame":
-                child.configure(background="#e8edf5", borderwidth=0, highlightthickness=0, relief="flat")
-            elif widget_class == "Label":
-                child.configure(background="#e8edf5", foreground=TEXT_COLOR, borderwidth=0, highlightthickness=0)
-        self.toolbar.pack(side=tk.LEFT, fill=tk.X)
-
-        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
-        self.canvas.get_tk_widget().configure(bg=BG_COLOR, highlightthickness=0)
-        self.canvas.mpl_connect("pick_event", self.on_pick)
-
-    def _load_segment_traces(self) -> list[SegmentTrace]:
-        traces: list[SegmentTrace] = []
-        segment_lookup: dict[str, tuple[str, int, float]] = {}
-        for event in self.detected_events:
-            for seg_idx, segment in enumerate(event.segments):
-                seg_name = event.event_name if seg_idx == 0 else f"{event.event_name}_{seg_idx}"
-                segment_lookup[seg_name] = (event.event_name, seg_idx, segment.baseline)
-
-        with h5py.File(self.settings.filepath, "r") as h5:
-            grp = h5["events"]
-            for result in self.segment_results:
-                base_event_name, _, baseline = segment_lookup[result.event_name]
-                data = grp[base_event_name][...]
-                traces.append(SegmentTrace(result=result, data=data, baseline=baseline))
-        return traces
-
-    def _style_axis(self, ax) -> None:
-        ax.set_facecolor(PANEL_COLOR)
-        for spine in ax.spines.values():
-            spine.set_color(MUTED_COLOR)
-        ax.tick_params(colors=MUTED_COLOR, labelsize=8)
-        ax.xaxis.label.set_color(TEXT_COLOR)
-        ax.yaxis.label.set_color(TEXT_COLOR)
-        ax.title.set_color(TEXT_COLOR)
-
-    def _plot_std_overlay(self, ax, std_time_ms: np.ndarray, std_trace: np.ndarray, std_threshold: float) -> None:
-        if std_trace.size == 0:
-            return
-        y_min, y_max = ax.get_ylim()
-        y_span = y_max - y_min
-        if y_span <= 0:
-            return
-        std_top = max(float(np.max(std_trace)), std_threshold)
-        if std_top <= 0:
-            return
-        overlay_base = y_min + 0.06 * y_span
-        overlay_height = 0.24 * y_span
-        scaled_std = overlay_base + (std_trace / std_top) * overlay_height
-        ax.plot(
-            std_time_ms,
-            scaled_std,
-            color="#ff7b72",
-            alpha=0.7,
-            linewidth=0.9,
-            zorder=8,
-        )
-        if std_threshold > 0:
-            scaled_threshold = overlay_base + (std_threshold / std_top) * overlay_height
-            ax.axhline(
-                scaled_threshold,
-                color="#b388ff",
-                alpha=0.75,
-                linestyle="--",
-                linewidth=0.8,
-                zorder=9,
-            )
-
-    def _metric_arrays(self, x_key: str, y_key: str) -> tuple[np.ndarray, np.ndarray]:
-        xs = np.array([getattr(row, x_key) for row in self.segment_results], dtype=float)
-        ys = np.array([getattr(row, y_key) for row in self.segment_results], dtype=float)
-        return xs, ys
-
-    def _facecolors(self) -> np.ndarray:
-        colors = []
-        for idx, row in enumerate(self.segment_results):
-            if idx in self.selected_indices:
-                colors.append(POS_COLOR if row.direction == 1 else NEG_COLOR)
-            else:
-                colors.append("#c0c8d2")
-        return np.array(colors, dtype=object)
-
-    def _edgecolors(self) -> np.ndarray:
-        colors = []
-        for idx in range(len(self.segment_results)):
-            colors.append(SELECT_EDGE if idx in self.selected_indices else "#c0c8d2")
-        return np.array(colors, dtype=object)
-
-    def render(self) -> None:
-        self.figure.clear()
-        self.collections.clear()
-        self.selectors.clear()
-        self.scatter_axes = {}
-
-        gs = self.figure.add_gridspec(3, 2, height_ratios=[1.0, 1.0, 0.95], hspace=0.30, wspace=0.22)
-        ax_dt_ec = self.figure.add_subplot(gs[0, 0])
-        ax_dt_rel = self.figure.add_subplot(gs[0, 1])
-        ax_ec_rel = self.figure.add_subplot(gs[1, 0])
-        ax_r_dt = self.figure.add_subplot(gs[1, 1])
-        ax_trace = self.figure.add_subplot(gs[2, :])
-
-        scatter_specs = [
-            ("dt_ec", ax_dt_ec, "dwell_time_ms", "area_nA_ms", "Dwell Time (ms)", "EC (nA ms)"),
-            ("dt_rel", ax_dt_rel, "dwell_time_ms", "delta_I_rel", "Dwell Time (ms)", "Relative  \u0394I"),
-            ("ec_rel", ax_ec_rel, "area_nA_ms", "delta_I_rel", "EC (nA ms)", "Relative \u0394I"),
-            ("r_dt", ax_r_dt, "resistance_MOhm", "dwell_time_ms", "R (MOhm)", "Dwell Time (ms)"),
+        for event in detected_events:
+            for index, segment in enumerate(event.segments):
+                name = event.event_name if index == 0 else f'{event.event_name}_{index}'
+                self.base_event_names[name] = event.event_name
+                self.segment_infos[name] = segment
+        self.setWindowTitle(f'Segment filtering · {Path(settings.filepath).name}')
+        self.resize(1400, 920)
+        layout = QtWidgets.QHBoxLayout(self)
+        sidebar = QtWidgets.QScrollArea()
+        sidebar.setWidgetResizable(True)
+        sidebar.setFixedWidth(245)
+        self.controls = QtWidgets.QWidget()
+        sidebar.setWidget(self.controls)
+        controls = QtWidgets.QVBoxLayout(self.controls)
+        self.time_range = EventTimeRange(self.event_times)
+        controls.addWidget(self.time_range)
+        button('Select all in range', self.select_all, controls)
+        button('Clear selection', self.clear_selection, controls)
+        button('Save selected CSV', self.save_selected_csv, controls)
+        button('Save selected H5', self.save_selected_h5, controls)
+        controls.addWidget(QtWidgets.QLabel('Drag mode'))
+        self.mode = QtWidgets.QComboBox()
+        self.mode.addItems(['Add', 'Remove', 'Pan'])
+        self.mode.currentTextChanged.connect(self.change_mode)
+        controls.addWidget(self.mode)
+        button('Reset view', self.reset_view, controls)
+        self.status = QtWidgets.QLabel()
+        self.status.setWordWrap(True)
+        controls.addWidget(self.status)
+        controls.addStretch()
+        layout.addWidget(sidebar)
+        self.graphics = pg.GraphicsLayoutWidget()
+        layout.addWidget(self.graphics, 1)
+        self.collections = []
+        self.views = []
+        self.plots = []
+        specs = [
+            ('dwell_time_ms', 'area_nA_ms', 'Dwell time (ms)', 'EC (nA ms)'),
+            ('dwell_time_ms', 'delta_I_rel', 'Dwell time (ms)', 'Relative ΔI'),
+            ('area_nA_ms', 'delta_I_rel', 'EC (nA ms)', 'Relative ΔI'),
+            ('resistance_MOhm', 'dwell_time_ms', 'Resistance (MΩ)', 'Dwell time (ms)'),
         ]
+        for index, (xkey, ykey, xlabel, ylabel) in enumerate(specs):
+            view = SelectionViewBox()
+            plot = self.graphics.addPlot(row=index // 2, col=index % 2, viewBox=view)
+            style_plot(plot, xlabel, ylabel)
+            plot.getAxis('left').setWidth(75)
+            xs = np.array([getattr(row, xkey) for row in segment_results])
+            ys = np.array([getattr(row, ykey) for row in segment_results])
+            indices = np.flatnonzero(np.isfinite(xs) & np.isfinite(ys))
+            scatter = pg.ScatterPlotItem(x=xs[indices], y=ys[indices], data=indices,
+                                         size=7, brush=scatter_brush('#b7c5d0'), pen=None)
+            scatter.sigClicked.connect(self.on_pick)
+            plot.addItem(scatter)
+            view.rectangleSelected.connect(lambda rect, x=xs, y=ys: self.on_select(rect, x, y))
+            self.collections.append((scatter, indices))
+            self.views.append(view)
+            self.plots.append(plot)
+        self.trace_plot = self.graphics.addPlot(row=2, col=0, colspan=2)
+        style_plot(self.trace_plot, 'Time within event (ms)', 'Current (nA)')
+        self.trace_plot.getAxis('left').setWidth(75)
+        self.trace_plot.setTitle('Select a point to view its trace')
+        self.time_range.rangeChanged.connect(self._time_range_changed)
+        self.update_selection()
 
-        for axis_id, ax, x_key, y_key, xlabel, ylabel in scatter_specs:
-            self._style_axis(ax)
-            self.scatter_axes[axis_id] = ax
-            xs, ys = self._metric_arrays(x_key, y_key)
-            coll = ax.scatter(
-                xs,
-                ys,
-                c=self._facecolors(),
-                edgecolors=self._edgecolors(),
-                linewidths=np.where(np.isin(np.arange(len(xs)), list(self.selected_indices)), 1.2, 0.7),
-                alpha=0.9,
-                s=28,
-                picker=True,
-            )
-            coll._segment_indices = np.arange(len(xs))
-            coll._axis_id = axis_id
-            coll._x_key = x_key
-            coll._y_key = y_key
-            ax.set_xlabel(xlabel)
-            ax.set_ylabel(ylabel)
-            self.collections.append(coll)
-            selector = RectangleSelector(
-                ax,
-                lambda e0, e1, axis=ax, x=x_key, y=y_key: self.on_select(axis, x, y, e0, e1),
-                useblit=False,
-                button=[1],
-                minspanx=5,
-                minspany=5,
-                spancoords="pixels",
-                interactive=False,
-            )
-            self.selectors.append(selector)
+    def _time_range_changed(self, *_):
+        self.update_selection()
 
-        self._style_axis(ax_trace)
-        self.ax_trace = ax_trace
-        ax_trace.set_xlabel("Time (ms)")
-        ax_trace.set_ylabel("Current (nA)")
-        self.update_trace_axis()
-        self.figure.subplots_adjust(left=0.05, right=0.98, top=0.97, bottom=0.07)
-        self.canvas.draw()
-        self.update_status()
+    def change_mode(self, mode):
+        for view in self.views:
+            view.selection_mode = mode
 
-    def update_collections(self) -> None:
-        facecolors = self._facecolors()
-        edgecolors = self._edgecolors()
-        linewidths = np.where(np.isin(np.arange(len(self.segment_results)), list(self.selected_indices)), 1.2, 0.7)
-        for coll in self.collections:
-            coll.set_facecolors(facecolors)
-            coll.set_edgecolors(edgecolors)
-            coll.set_linewidths(linewidths)
+    def reset_view(self):
+        for plot in self.plots:
+            plot.enableAutoRange()
 
-    def update_trace_axis(self) -> None:
-        if self.ax_trace is None:
+    def on_pick(self, scatter, points, event):
+        if not points:
             return
-        ax_trace = self.ax_trace
-        ax_trace.clear()
-        self._style_axis(ax_trace)
-        ax_trace.set_xlabel("Time (ms)")
-        ax_trace.set_ylabel("Current (nA)")
-        if self.last_selected_index is not None:
-            trace = self.segment_traces[self.last_selected_index]
-            result = trace.result
-            time_ms = np.arange(len(trace.data)) / self.settings.samp_freq
-            ax_trace.plot(time_ms, trace.data, color=TRACE_COLOR, linewidth=0.9)
-            ax_trace.axvspan(
-                result.start / self.settings.samp_freq,
-                result.end / self.settings.samp_freq,
-                color=POS_COLOR if result.direction == 1 else NEG_COLOR,
-                alpha=0.10,
-            )
-            ax_trace.axhline(trace.baseline, color="#8b949e", linestyle="--", linewidth=0.9)
-            threshold_value = threshold_guide_value(
-                trace.baseline,
-                result.direction,
-                self.settings.threshold_nA,
-            )
-            ax_trace.axhline(
-                threshold_value,
-                color="#7ee787",
-                linestyle="--",
-                linewidth=0.8,
-            )
-            return_threshold_value = threshold_guide_value(
-                trace.baseline,
-                result.direction,
-                self.settings.return_threshold_nA,
-            )
-            ax_trace.axhline(
-                return_threshold_value,
-                color="#ff7b72",
-                linestyle="--",
-                linewidth=0.8,
-            )
-            segment_info = self.segment_infos.get(result.event_name)
-            if self.settings.end_at_std_peak and segment_info is not None:
-                std_time_ms, std_trace, std_threshold = get_segment_end_std_overlay(
-                    trace.data,
-                    segment_info,
-                    self.settings,
-                )
-                self._plot_std_overlay(ax_trace, std_time_ms, std_trace, std_threshold)
-            ax_trace.text(
-                0.02,
-                0.95,
-                result.event_name,
-                transform=ax_trace.transAxes,
-                ha="left",
-                va="top",
-                color=TEXT_COLOR,
-                fontsize=9,
-                fontweight="bold",
-                bbox={"facecolor": BG_COLOR, "alpha": 0.55, "edgecolor": "none", "pad": 2.5},
-                zorder=20,
-            )
+        index = int(points[0].data())
+        if not self.time_range.contains(self.event_times)[index]:
+            return
+        if index in self.selected_indices:
+            self.selected_indices.remove(index)
+            if self.last_selected_index == index:
+                self.last_selected_index = None
         else:
-            ax_trace.text(
-                0.5,
-                0.5,
-                "Select a point to view its trace",
-                transform=ax_trace.transAxes,
-                ha="center",
-                va="center",
-                color=MUTED_COLOR,
-            )
+            self.selected_indices.add(index)
+            self.last_selected_index = index
+        self.update_selection()
 
-    def refresh_selection_views(self) -> None:
-        self.update_collections()
-        self.update_trace_axis()
-        self.canvas.draw_idle()
-        self.update_status()
-
-    def update_status(self) -> None:
-        self.status_var.set(f"{len(self.selected_indices)} selected of {len(self.segment_results)} segments.")
-
-    def on_pick(self, event) -> None:
-        if not hasattr(event.artist, "_segment_indices"):
-            return
-        if len(event.ind) == 0:
-            return
-        idx = int(event.ind[0])
-        if idx in self.selected_indices:
-            self.selected_indices.remove(idx)
-        else:
-            self.selected_indices.add(idx)
-            self.last_selected_index = idx
-        self.refresh_selection_views()
-
-    def on_select(self, axis, x_key: str, y_key: str, eclick, erelease) -> None:
-        if eclick.xdata is None or eclick.ydata is None or erelease.xdata is None or erelease.ydata is None:
-            return
-        xmin, xmax = sorted([eclick.xdata, erelease.xdata])
-        ymin, ymax = sorted([eclick.ydata, erelease.ydata])
-        xs, ys = self._metric_arrays(x_key, y_key)
-        mask = (xs >= xmin) & (xs <= xmax) & (ys >= ymin) & (ys <= ymax)
-        indices = np.where(mask)[0]
-        if indices.size == 0:
-            return
-        if self.box_select_mode.get() == "remove":
-            for idx in indices.tolist():
-                self.selected_indices.discard(idx)
-            if self.last_selected_index in indices.tolist():
+    def on_select(self, rect, xs, ys):
+        indices = np.flatnonzero((xs >= rect.left()) & (xs <= rect.right()) &
+                                 (ys >= rect.top()) & (ys <= rect.bottom()) & self.time_range.contains(self.event_times))
+        if self.mode.currentText() == 'Remove':
+            self.selected_indices.difference_update(indices.tolist())
+            if self.last_selected_index not in self.selected_indices:
                 self.last_selected_index = None
         else:
             self.selected_indices.update(indices.tolist())
-            self.last_selected_index = int(indices[0])
-        self.refresh_selection_views()
+            if len(indices):
+                self.last_selected_index = int(indices[0])
+        self.update_selection()
 
-    def clear_selection(self) -> None:
+    def select_all(self):
+        self.selected_indices = set(np.flatnonzero(self.time_range.contains(self.event_times)).tolist())
+        self.last_selected_index = min(self.selected_indices) if self.selected_indices else None
+        self.update_selection()
+
+    def clear_selection(self):
         self.selected_indices.clear()
         self.last_selected_index = None
-        self.refresh_selection_views()
+        self.update_selection()
 
-    def _default_csv_path(self) -> str:
-        base = os.path.splitext(os.path.basename(self.settings.filepath))[0]
-        return os.path.join(os.path.dirname(self.settings.filepath), f"{base}_filtered.csv")
+    def update_selection(self):
+        eligible = self.time_range.contains(self.event_times)
+        self.selected_indices.intersection_update(np.flatnonzero(eligible).tolist())
+        if self.last_selected_index not in self.selected_indices:
+            self.last_selected_index = None
+        for scatter, indices in self.collections:
+            scatter.setBrush([scatter_brush(('#ff7655' if self.segment_results[i].direction == 1 else '#149bff')
+                                            if i in self.selected_indices else '#aeb8c3',
+                                            170 if eligible[i] else 40) for i in indices])
+        self.trace_plot.clear()
+        if self.last_selected_index is not None:
+            row = self.segment_results[self.last_selected_index]
+            name = self.base_event_names[row.event_name]
+            segment = self.segment_infos[row.event_name]
+            with h5py.File(self.settings.filepath, 'r') as h5:
+                data = h5['events'][name][...]
+            draw_trace(self.trace_plot, EventPreview(row.event_name, row.timestamp, data, segment.baseline, [segment]),
+                       self.settings.samp_freq, self.settings)
+        else:
+            self.trace_plot.setTitle('Select a point to view its trace')
+        missing = int(np.count_nonzero(~np.isfinite(self.event_times)))
+        note = f' {missing} without timestamps cannot be selected within a time range.' if missing and self.time_range.available else ''
+        self.status.setText(f'{len(self.selected_indices)} selected · {int(eligible.sum())} of {len(self.segment_results)} segments in range. Click to toggle; drag to add/remove; scroll to zoom.' + note)
+        self.selectionChanged.emit({self.segment_results[i].event_name for i in self.selected_indices})
 
-    def _default_h5_path(self) -> str:
-        base = os.path.splitext(os.path.basename(self.settings.filepath))[0]
-        return os.path.join(os.path.dirname(self.settings.filepath), f"{base}_filtered.h5")
-
-    def save_selected_csv(self) -> None:
+    def _save(self, extension):
         if not self.selected_indices:
-            messagebox.showinfo("Save Selected CSV", "No segments selected.", parent=self.window)
+            QtWidgets.QMessageBox.information(self, 'Save selection', 'No segments selected.')
             return
-        path = filedialog.asksaveasfilename(
-            parent=self.window,
-            title="Save selected CSV",
-            defaultextension=".csv",
-            initialfile=os.path.basename(self._default_csv_path()),
-            initialdir=os.path.dirname(self._default_csv_path()),
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
-        )
+        source = Path(self.settings.filepath)
+        default = str(source.with_name(source.stem + '_filtered.' + extension))
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, 'Save selected segments', default,
+                                                       f'{extension.upper()} files (*.{extension})')
         if not path:
             return
-        rows = [self.segment_results[idx] for idx in sorted(self.selected_indices)]
-        import csv
-        with open(path, "w", newline="") as fh:
-            writer = csv.writer(fh)
-            writer.writerow([
-                "event_name", "timestamp", "dwell_time_ms", "direction", "start", "end",
-                "area_nA_ms", "delta_I_nA", "delta_I_rel", "resistance_MOhm"
-            ])
-            for row in rows:
-                writer.writerow([
-                    row.event_name, row.timestamp, row.dwell_time_ms, row.direction, row.start, row.end,
-                    row.area_nA_ms, row.delta_I_nA, row.delta_I_rel, row.resistance_MOhm
-                ])
-        messagebox.showinfo("Save Selected CSV", f"Saved selected rows to:\n{path}", parent=self.window)
+        if not Path(path).suffix:
+            path += '.' + extension
+        try:
+            if Path(path).resolve() == source.resolve():
+                raise ValueError('The input file cannot be overwritten.')
+            rows = [self.segment_results[i] for i in sorted(self.selected_indices)]
+            if extension == 'csv':
+                write_selected_csv(path, rows)
+            else:
+                write_selected_h5(path, self.settings, rows, self.base_event_names)
+            self.status.setText(f'Saved {len(rows)} selected segments to {path}')
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, 'Save failed', str(exc))
 
-    def save_selected_h5(self) -> None:
-        if not self.selected_indices:
-            messagebox.showinfo("Save Selected H5", "No segments selected.", parent=self.window)
-            return
-        path = filedialog.asksaveasfilename(
-            parent=self.window,
-            title="Save selected H5",
-            defaultextension=".h5",
-            initialfile=os.path.splitext(os.path.basename(self._default_h5_path()))[0],
-            initialdir=os.path.dirname(self._default_h5_path()),
-            filetypes=[("HDF5 files", "*.h5 *.hdf5"), ("All files", "*.*")],
-        )
-        if not path:
-            return
+    def save_selected_csv(self):
+        self._save('csv')
 
-        selected_rows = [self.segment_results[idx] for idx in sorted(self.selected_indices)]
-        with h5py.File(self.settings.filepath, "r") as src, h5py.File(path, "w") as dst:
-            src_events = src["events"]
-            out_events = dst.create_group("events")
-
-            event_names = sorted(src_events.keys())
-            if event_names:
-                start_name = event_names[0]
-                start_ds = src_events[start_name]
-                copied = out_events.create_dataset(start_name, data=start_ds[()])
-                for key, value in start_ds.attrs.items():
-                    copied.attrs[key] = value
-
-            for row in selected_rows:
-                src_name = self.base_event_names.get(row.event_name, row.event_name)
-                if src_name not in src_events:
-                    continue
-                src_ds = src_events[src_name]
-                copied = out_events.create_dataset(row.event_name, data=src_ds[()])
-                for key, value in src_ds.attrs.items():
-                    copied.attrs[key] = value
-                copied.attrs["source_event_name"] = src_name
-        messagebox.showinfo("Save Selected H5", f"Saved filtered events to:\n{path}", parent=self.window)
+    def save_selected_h5(self):
+        self._save('h5')

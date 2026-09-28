@@ -1,21 +1,17 @@
 from __future__ import annotations
 
 import copy
-import re
-import tkinter as tk
 from dataclasses import dataclass
-from tkinter import messagebox, ttk
 
 import h5py
-import matplotlib
-matplotlib.use("TkAgg")
 import numpy as np
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.figure import Figure
 from numpy.lib.stride_tricks import sliding_window_view
 from scipy.signal import find_peaks
 
-from .dwell_t import DetectedEvent, DetectedSegment, Settings, collect_segment_results, compute_samples_per_buffer
+from .dwell_t import DetectedEvent, DetectedSegment, EventPreview, Settings, compute_samples_per_buffer
+from pyqtgraph.Qt import QtCore, QtWidgets
+from .plots import TraceGrid, add_std_overlay
+from .qt_helpers import TaskRunner, button, number_field
 
 
 DEFAULT_STD_WINDOW_MS = 0.0
@@ -155,171 +151,103 @@ def evaluate_vibration_segments(
     return filtered_events, removed
 
 
-class VibrationRemovalWindow:
-    def __init__(
-        self,
-        parent,
-        settings: Settings,
-        source_events: list[DetectedEvent],
-        apply_callback,
-    ) -> None:
-        self.parent = parent
+class VibrationRemovalWindow(QtWidgets.QDialog):
+    def __init__(self, parent, settings, source_events, apply_callback):
+        super().__init__(parent)
         self.settings = settings
         self.source_events = copy.deepcopy(source_events)
         self.apply_callback = apply_callback
-        self.confirmed = False
-        self.current_events = copy.deepcopy(source_events)
-        self.removed_previews: list[RemovedSegmentPreview] = []
-        self.original_events = copy.deepcopy(source_events)
-        self.current_sample: list[RemovedSegmentPreview] = []
+        self.current_events = None
+        self.removed_previews = []
         self.rng = np.random.default_rng()
+        self.setWindowTitle('Vibration removal')
+        self.resize(1400, 900)
+        self.runner = TaskRunner(self)
+        self.runner.busyChanged.connect(self._busy_changed)
+        self.runner.failed.connect(self._failed)
+        layout = QtWidgets.QHBoxLayout(self)
+        sidebar = QtWidgets.QScrollArea()
+        sidebar.setWidgetResizable(True)
+        sidebar.setFixedWidth(255)
+        self.controls = QtWidgets.QWidget()
+        sidebar.setWidget(self.controls)
+        controls = QtWidgets.QVBoxLayout(self.controls)
+        self.fields = {}
+        for key, label, default in [
+            ('std_window_ms', 'Window (ms)', DEFAULT_STD_WINDOW_MS),
+            ('std_context_ms', 'Context (ms)', DEFAULT_STD_CONTEXT_MS),
+            ('std_height_factor', 'Height factor', DEFAULT_STD_HEIGHT_FACTOR),
+            ('std_prominence', 'Prominence', DEFAULT_STD_PROMINENCE),
+        ]:
+            controls.addWidget(QtWidgets.QLabel(label))
+            field = number_field(default)
+            self.fields[key] = field
+            field.valueChanged.connect(self._invalidate)
+            controls.addWidget(field)
+        button('Preview removal', self.refresh_preview, controls)
+        button('Randomise examples', self.render_removed_previews, controls)
+        self.confirm_button = button('Confirm', self.confirm, controls)
+        self.status = QtWidgets.QLabel('Preview changes, then confirm to apply. Closing leaves the working list unchanged.')
+        self.status.setWordWrap(True)
+        controls.addWidget(self.status)
+        controls.addStretch()
+        layout.addWidget(sidebar)
+        self.grid = TraceGrid(rows=4)
+        layout.addWidget(self.grid, 1)
+        self.confirm_button.setEnabled(False)
+        QtCore.QTimer.singleShot(0, self.refresh_preview)
 
-        self.window = tk.Toplevel(parent)
-        self.window.title("Vibration Removal")
-        self.window.geometry("1450x900")
-        self.window.configure(bg=BG_COLOR)
-        self.window.protocol("WM_DELETE_WINDOW", self.on_close)
+    def _invalidate(self, *_):
+        self.current_events = None
+        self.confirm_button.setEnabled(False)
+        self.status.setText('Settings changed. Preview removal again before confirming.')
 
-        self.std_window_var = tk.StringVar(value=str(DEFAULT_STD_WINDOW_MS))
-        self.std_context_var = tk.StringVar(value=str(DEFAULT_STD_CONTEXT_MS))
-        self.std_height_var = tk.StringVar(value=str(DEFAULT_STD_HEIGHT_FACTOR))
-        self.std_prominence_var = tk.StringVar(value=str(DEFAULT_STD_PROMINENCE))
-        self.status_var = tk.StringVar(value="Set std options and preview vibration removal.")
+    def refresh_preview(self):
+        options = VibrationSettings(**{key: field.value() for key, field in self.fields.items()})
+        self.status.setText('Evaluating vibration signatures…')
 
-        self._build_ui()
-        self.refresh_preview()
-
-    def _build_ui(self) -> None:
-        controls = ttk.Frame(self.window, padding=12)
-        controls.pack(side=tk.TOP, fill=tk.X)
-
-        ttk.Label(controls, text="Window (ms)").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(controls, textvariable=self.std_window_var, width=10).grid(row=0, column=1, sticky="w", pady=4)
-        ttk.Label(controls, text="Context (ms)").grid(row=0, column=2, sticky="w", padx=(16, 8), pady=4)
-        ttk.Entry(controls, textvariable=self.std_context_var, width=10).grid(row=0, column=3, sticky="w", pady=4)
-        ttk.Label(controls, text="Height factor").grid(row=0, column=4, sticky="w", padx=(16, 8), pady=4)
-        ttk.Entry(controls, textvariable=self.std_height_var, width=10).grid(row=0, column=5, sticky="w", pady=4)
-        ttk.Label(controls, text="Prominence").grid(row=0, column=6, sticky="w", padx=(16, 8), pady=4)
-        ttk.Entry(controls, textvariable=self.std_prominence_var, width=10).grid(row=0, column=7, sticky="w", pady=4)
-        ttk.Button(controls, text="Preview Removal", command=self.refresh_preview).grid(row=0, column=8, padx=(12, 0), pady=4)
-        ttk.Button(controls, text="Randomise Selection", command=self.show_another_random).grid(row=0, column=9, padx=(8, 0), pady=4)
-        ttk.Button(controls, text="Confirm", command=self.confirm).grid(row=0, column=10, padx=(8, 0), pady=4)
-
-        ttk.Label(self.window, textvariable=self.status_var, padding=(12, 0, 12, 8)).pack(side=tk.TOP, fill=tk.X)
-
-        self.figure = Figure(figsize=(14.2, 8.4), dpi=100, facecolor=BG_COLOR)
-        self.canvas = FigureCanvasTkAgg(self.figure, master=self.window)
-        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
-        self.canvas.get_tk_widget().configure(bg=BG_COLOR, highlightthickness=0)
-
-    def read_std_settings(self) -> VibrationSettings:
-        return VibrationSettings(
-            std_window_ms=float(self.std_window_var.get()),
-            std_context_ms=float(self.std_context_var.get()),
-            std_height_factor=float(self.std_height_var.get()),
-            std_prominence=float(self.std_prominence_var.get()),
-        )
-
-    def refresh_preview(self) -> None:
-        try:
-            vibration_settings = self.read_std_settings()
-            filtered, removed = evaluate_vibration_segments(
-                self.settings,
-                self.source_events,
-                vibration_settings,
-            )
-            self.current_events = filtered
-            self.removed_previews = removed
-            self.apply_callback(copy.deepcopy(filtered), keep_window=True)
-            self.current_sample = self.select_removed_sample()
+        def ready(result):
+            self.current_events, self.removed_previews = result
             self.render_removed_previews()
-            kept_count = sum(len(event.segments) for event in filtered)
-            self.status_var.set(
-                f"Removed {len(removed)} segments; {kept_count} segments remain in the working list."
-            )
-        except Exception as exc:
-            messagebox.showerror("Vibration removal failed", str(exc), parent=self.window)
+            kept = sum(len(event.segments) for event in self.current_events)
+            self.status.setText(f'{len(self.removed_previews)} segments would be removed; {kept} remain. Confirm to apply.')
+            self.confirm_button.setEnabled(True)
 
-    def select_removed_sample(self) -> list[RemovedSegmentPreview]:
-        if not self.removed_previews:
-            return []
-        sample_size = min(MAX_REMOVED_PLOTS, len(self.removed_previews))
-        idx = self.rng.choice(len(self.removed_previews), size=sample_size, replace=False)
-        return [self.removed_previews[i] for i in sorted(idx)]
+        self.runner.start(lambda: evaluate_vibration_segments(self.settings, self.source_events, options), ready)
 
-    def show_another_random(self) -> None:
-        if not self.removed_previews:
-            return
-        self.current_sample = self.select_removed_sample()
-        self.render_removed_previews()
+    def render_removed_previews(self):
+        count = min(MAX_REMOVED_PLOTS, len(self.removed_previews))
+        indices = sorted(self.rng.choice(len(self.removed_previews), size=count, replace=False))
+        entries = [self.removed_previews[i] for i in indices]
+        previews = [EventPreview(entry.segment_label, entry.timestamp, entry.data_full, entry.baseline,
+                                  [DetectedSegment(entry.start, entry.end, 1, entry.baseline)]) for entry in entries]
+        # End-peak overlays here use the vibration window's own settings below.
+        from dataclasses import replace
+        display_settings = replace(self.settings, end_at_std_peak=False)
+        self.grid.display(previews, self.settings.samp_freq, display_settings)
+        for plot, entry in zip(self.grid.plots, entries):
+            add_std_overlay(plot, entry.data_full, entry.std_time_ms, entry.std_trace, entry.std_threshold)
 
-    def render_removed_previews(self) -> None:
-        self.figure.clear()
-        sample = self.current_sample or self.removed_previews[:MAX_REMOVED_PLOTS]
-        ncols = 3
-        nrows = 4
-        axes = self.figure.subplots(nrows, ncols, squeeze=False).ravel()
+    def _busy_changed(self, busy):
+        self.controls.setEnabled(not busy)
 
-        for idx, (ax, entry) in enumerate(zip(axes, sample)):
-            row = idx // ncols
-            col = idx % ncols
-            ax.set_facecolor(PANEL_COLOR)
-            for spine in ax.spines.values():
-                spine.set_color(MUTED_COLOR)
-            ax.tick_params(colors=MUTED_COLOR, labelsize=7)
-            ax.xaxis.label.set_color(TEXT_COLOR)
-            ax.yaxis.label.set_color(TEXT_COLOR)
+    def _failed(self, message):
+        self.current_events = None
+        self.confirm_button.setEnabled(False)
+        self.status.setText(message)
+        QtWidgets.QMessageBox.warning(self, 'Vibration removal failed', message)
 
-            time_ms = np.arange(len(entry.data_full)) / self.settings.samp_freq
-            ax.plot(time_ms, entry.data_full, color="#c7d0d9", linewidth=0.8)
-            ax.axhline(entry.baseline, color="#7ee787", linestyle="--", linewidth=0.8)
-            ax.axvspan(entry.start / self.settings.samp_freq, entry.end / self.settings.samp_freq, color="#ffb86b", alpha=0.12)
-            match = re.search(r"(\d+)$", entry.event_name)
-            event_label = f"Event {int(match.group(1))}" if match else entry.segment_label
-            ax.text(
-                0.03,
-                0.95,
-                event_label,
-                transform=ax.transAxes,
-                ha="left",
-                va="top",
-                color=TEXT_COLOR,
-                fontsize=8,
-                fontweight="bold",
-                bbox={"facecolor": BG_COLOR, "alpha": 0.55, "edgecolor": "none", "pad": 2.5},
-            )
-            ax.set_xlabel("Time (ms)" if row == nrows - 1 else "")
-            ax.set_ylabel("Current (nA)" if col == 0 else "")
+    def confirm(self):
+        if self.current_events is not None and not self.runner.busy:
+            self.apply_callback(copy.deepcopy(self.current_events), keep_window=False)
+            self.accept()
 
-            ax2 = ax.twinx()
-            for spine in ax2.spines.values():
-                spine.set_color(MUTED_COLOR)
-            ax2.tick_params(colors=MUTED_COLOR, labelsize=6)
-            ax2.yaxis.label.set_color(TEXT_COLOR)
-            ax2.yaxis.labelpad = 10
-            std_top = max(
-                float(np.max(entry.std_trace)) if entry.std_trace.size else 0.0,
-                entry.std_threshold,
-            )
-            ax2.set_ylim(0.0, std_top * 1.9 if std_top > 0 else 1.0)
-            if entry.std_trace.size:
-                ax2.plot(entry.std_time_ms, entry.std_trace, color="#ff7b72", linewidth=0.9, alpha=0.7)
-            if entry.std_threshold > 0:
-                ax2.axhline(entry.std_threshold, color="#b388ff", linestyle="--", linewidth=0.8)
-            ax2.set_ylabel("Std (nA)" if col == ncols - 1 else "")
+    def reject(self):
+        if not self.runner.busy:
+            super().reject()
 
-        for ax in axes[len(sample):]:
-            ax.axis("off")
-
-        self.figure.subplots_adjust(left=0.05, right=0.94, top=0.96, bottom=0.06, wspace=0.34, hspace=0.38)
-        self.canvas.draw()
-
-    def confirm(self) -> None:
-        self.confirmed = True
-        self.apply_callback(copy.deepcopy(self.current_events), keep_window=False)
-        self.window.destroy()
-
-    def on_close(self) -> None:
-        if not self.confirmed:
-            self.apply_callback(copy.deepcopy(self.original_events), keep_window=False)
-        self.window.destroy()
+    def closeEvent(self, event):
+        if self.runner.busy:
+            event.ignore()
+        else:
+            event.accept()

@@ -58,7 +58,7 @@ class AOTrack:
     def __init__(self, t_s, v_v, default_v=0.0):
         t = np.asarray(t_s, dtype=float)
         v = np.asarray(v_v, dtype=float)
-        order = np.argsort(t)
+        order = np.argsort(t, kind="stable")
         t = t[order]
         v = v[order]
         # de-duplicate consecutive duplicates (same time & value)

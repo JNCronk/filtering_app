@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-import csv
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import h5py
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 from scipy.ndimage import gaussian_filter1d
 from scipy.signal import find_peaks
+from scipy.integrate import trapezoid
+
+from .H5Splitter_1000 import list_events
 
 
 DEFAULT_H5 = ""
@@ -44,6 +46,8 @@ class Settings:
     end_std_height_factor: float = DEFAULT_END_STD_HEIGHT_FACTOR
     end_std_prominence: float = DEFAULT_END_STD_PROMINENCE
     end_std_pre_crossing_buffer_fraction: float = DEFAULT_END_STD_PRE_CROSSING_BUFFER_FRACTION
+    event_names: tuple[str, ...] | None = None
+    event_voltages_mV: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -84,6 +88,7 @@ class SegmentResult:
     delta_I_nA: float
     delta_I_rel: float
     resistance_MOhm: float
+    voltage_mV: float = DEFAULT_VOLTAGE_MV
 
 
 @dataclass(frozen=True)
@@ -207,7 +212,7 @@ def _segment_metric_key(
     segment_data = data[segment.start : segment.end + 1]
     dt_ms = 1.0 / samp_freq
     dwell_time_ms = (segment.end - segment.start + 1) / samp_freq
-    area_nA_ms = float(np.trapz(np.abs(segment_data - segment.baseline), dx=dt_ms))
+    area_nA_ms = float(trapezoid(np.abs(segment_data - segment.baseline), dx=dt_ms))
     delta_I = segment_data - segment.baseline
     delta_I_nA = float(np.average(delta_I))
     delta_I_rel = float(delta_I_nA / segment.baseline) if segment.baseline != 0 else 0.0
@@ -224,6 +229,7 @@ def _deduplicate_adjacent_segments(
     detected_events: list[DetectedEvent],
     event_data_map: dict[str, np.ndarray],
     samp_freq: float,
+    adjacent_pairs: set[tuple[str, str]] | None = None,
 ) -> list[DetectedEvent]:
     if len(detected_events) < 2:
         return detected_events
@@ -260,6 +266,9 @@ def _deduplicate_adjacent_segments(
         metric_maps.append(event_metric_map)
 
     for event_idx in range(len(detected_events) - 1):
+        pair = (detected_events[event_idx].event_name, detected_events[event_idx + 1].event_name)
+        if adjacent_pairs is not None and pair not in adjacent_pairs:
+            continue
         current_map = metric_maps[event_idx]
         next_map = metric_maps[event_idx + 1]
         shared_keys = current_map.keys() & next_map.keys()
@@ -421,7 +430,7 @@ def list_event_names(filepath: str) -> tuple[str | None, list[str]]:
     with h5py.File(filepath, "r") as h5:
         if "events" not in h5:
             raise ValueError("No 'events' group found in file.")
-        event_names = sorted(list(h5["events"].keys()))
+        event_names = list_events(h5["events"])
     if not event_names:
         raise ValueError("No events datasets found in the 'events' group.")
     first_event = event_names[0]
@@ -471,9 +480,13 @@ def iter_detected_events(settings: Settings) -> list[DetectedEvent]:
             raise ValueError("No 'events' group found in file.")
 
         events_grp = h5["events"]
-        event_names = sorted(list(events_grp.keys()))
+        event_names = list_events(events_grp)
+        wanted = set(settings.event_names) if settings.event_names is not None else None
         for idx, event_name in enumerate(event_names):
             if idx == 0:
+                continue
+
+            if wanted is not None and event_name not in wanted:
                 continue
 
             event_dset = events_grp[event_name]
@@ -489,11 +502,17 @@ def iter_detected_events(settings: Settings) -> list[DetectedEvent]:
                     segments=segments,
                 )
             )
-    return _deduplicate_adjacent_segments(detected, event_data_map, settings.samp_freq)
+    adjacent_pairs = {
+        (left, right) for left, right in zip(event_names[1:], event_names[2:])
+        if settings.event_voltages_mV.get(left, settings.voltage_mV)
+        == settings.event_voltages_mV.get(right, settings.voltage_mV)
+    }
+    return _deduplicate_adjacent_segments(detected, event_data_map, settings.samp_freq, adjacent_pairs)
 
 
 def collect_segment_results(settings: Settings, detected_events: list[DetectedEvent] | None = None) -> list[SegmentResult]:
-    detected_events = detected_events or iter_detected_events(settings)
+    if detected_events is None:
+        detected_events = iter_detected_events(settings)
     results: list[SegmentResult] = []
 
     with h5py.File(settings.filepath, "r") as h5:
@@ -510,12 +529,13 @@ def collect_segment_results(settings: Settings, detected_events: list[DetectedEv
                 segment_name = event.event_name if segment_idx == 0 else f"{event.event_name}_{segment_idx}"
                 segment = data[segment_info.start : segment_info.end + 1]
                 dt_ms = 1.0 / settings.samp_freq
-                area_abs = float(np.trapz(np.abs(segment - segment_info.baseline), dx=dt_ms))
+                area_abs = float(trapezoid(np.abs(segment - segment_info.baseline), dx=dt_ms))
                 delta_I = segment - segment_info.baseline
                 av_delta_I = float(np.average(delta_I))
                 av_delta_I_rel = float(av_delta_I / segment_info.baseline) if segment_info.baseline != 0 else 0.0
+                voltage_mV = settings.event_voltages_mV.get(event.event_name, settings.voltage_mV)
                 resistance_MOhm = (
-                    float(settings.voltage_mV / segment_info.baseline) if segment_info.baseline != 0 else float("nan")
+                    float(voltage_mV / segment_info.baseline) if segment_info.baseline != 0 else float("nan")
                 )
                 dwell_time_ms = (segment_info.end - segment_info.start + 1) / settings.samp_freq
                 results.append(
@@ -530,6 +550,7 @@ def collect_segment_results(settings: Settings, detected_events: list[DetectedEv
                         delta_I_nA=av_delta_I,
                         delta_I_rel=av_delta_I_rel,
                         resistance_MOhm=resistance_MOhm,
+                        voltage_mV=voltage_mV,
                     )
                 )
 

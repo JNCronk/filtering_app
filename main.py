@@ -1,8 +1,8 @@
 """
-Compatibility launcher for the dwell_t preview app.
+Launcher for the Qt / PyQtGraph event filtering app.
 
 Run with:
-    python3 app/main.py
+    python3 main.py [event_file.h5]
 """
 
 from pathlib import Path
@@ -10,10 +10,12 @@ import sys
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from filtering_app import main
+    from filtering_app.ui import main
 else:
-    from filtering_app import main
+    from .ui import main
 
 
 if __name__ == "__main__":
     main()
+
+

@@ -1,645 +1,612 @@
 from __future__ import annotations
 
 import copy
-import os
-import re
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+import sys
+from dataclasses import replace
+from pathlib import Path
 
-import matplotlib
-matplotlib.use("TkAgg")
 import numpy as np
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
-from matplotlib.figure import Figure
+from pyqtgraph.Qt import QtCore, QtWidgets
 
-from .dwell_t import (
-    DetectedEvent,
-    SegmentResult,
-    DEFAULT_BUFFER_TIME_MS,
-    DEFAULT_END_AT_STD_PEAK,
-    DEFAULT_END_STD_HEIGHT_FACTOR,
-    DEFAULT_END_STD_PROMINENCE,
-    DEFAULT_END_STD_PRE_CROSSING_BUFFER_FRACTION,
-    DEFAULT_END_STD_WINDOW_MS,
-    DEFAULT_H5,
-    DEFAULT_MIN_SEPARATION_MS,
-    DEFAULT_RETURN_THRESHOLD_NA,
-    DEFAULT_SAMP_FREQ,
-    DEFAULT_THRESHOLD_NA,
-    DEFAULT_VOLTAGE_MV,
-    PREVIEW_COUNT,
-    EventPreview,
-    Settings,
-    collect_segment_results,
-    get_segment_end_std_overlay,
-    iter_detected_events,
-    list_event_names,
-    load_previews_from_events,
-    threshold_guide_value,
-)
+from . import dwell_t as analysis
+from .event_source import inspect_file, prepare_voltage_groups, read_raw_previews, write_voltage_splits
+from .plots import SegmentPreviewWindow, SummaryPlots, TraceGrid, configure_plots
+from .qt_helpers import APP_STYLE, TaskRunner, button, number_field
 from .segment_filter import SegmentFilterWindow
 from .vibration_removal import VibrationRemovalWindow
 
 
-BG_COLOR = "#f5f7fb"
-PANEL_COLOR = "#ffffff"
-FIELD_COLOR = "#ffffff"
-TEXT_COLOR = "#18212b"
-MUTED_COLOR = "#5f6b7a"
-TOOLBAR_COLOR = "#e8edf5"
-TRACE_COLOR = "#4a5564"
-BASELINE_COLOR = "#7a828c"
-BEGIN_THRESHOLD_COLOR = "#2da44e"
-RETURN_THRESHOLD_COLOR = "#d73a49"
-POS_HIGHLIGHT_COLOR = "#ef6c63"
-NEG_HIGHLIGHT_COLOR = "#4a9eff"
-STD_PEAK_COLOR = "#ff7b72"
-LINE_EXTENSION_MS = 1
-AXIS_LABEL_FONTSIZE = 8
-TICK_LABELSIZE = 7
-EVENT_LABEL_FONTSIZE = 8
-SEGMENT_LABEL_FONTSIZE = 7.5
-HIST_TITLE_FONTSIZE = 8
-HIST_BAR_COLOR = "#49C957"
-FULL_TRACE_XPAD_MS = 2.0
-FULL_TRACE_YPAD_FRAC = 0.05
+def dropped_file(mime):
+    if not mime.hasUrls():
+        return None
+    urls = mime.urls()
+    if len(urls) != 1 or not urls[0].isLocalFile():
+        return None
+    path = urls[0].toLocalFile()
+    return path if Path(path).suffix.lower() in {'.h5', '.hdf5'} else None
 
 
-class FilteringToolbar(NavigationToolbar2Tk):
-    toolitems = tuple(
-        item for item in NavigationToolbar2Tk.toolitems
-        if item[0] != "Subplots"
-    )
+class DropArea(QtWidgets.QLabel):
+    fileDropped = QtCore.Signal(str)
 
+    def __init__(self):
+        super().__init__('Drop an H5 file anywhere')
+        self.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.setAcceptDrops(True)
+        self.setMinimumHeight(32)
+        self.setMaximumHeight(44)
+        self.setWordWrap(True)
+        self.setStyleSheet('QLabel {border: 2px dashed #9cbbd2; border-radius: 10px; background: #edf5fb; color: #42627e; padding: 4px;}')
 
-class DwellTApp:
-    def __init__(self, root: tk.Tk) -> None:
-        self.root = root
-        self.root.title("Event Filtering")
-        self.root.geometry("1500x950")
-        self.root.configure(bg=BG_COLOR)
+    def dragEnterEvent(self, event):
+        if dropped_file(event.mimeData()):
+            event.acceptProposedAction()
 
-        self.rng = np.random.default_rng()
-        self.cached_filepath = ""
-        self.first_event_name: str | None = None
-        self.available_event_names: list[str] = []
-        self.current_preview_names: list[str] = []
-        self.cached_settings_key: tuple | None = None
-        self.cached_detected_events: list[DetectedEvent] | None = None
-        self.cached_segment_results: list[SegmentResult] = []
-        self.active_detected_events: list[DetectedEvent] = []
-        self.active_segment_results: list[SegmentResult] = []
-
-        self.filepath_var = tk.StringVar(value=DEFAULT_H5)
-        self.samp_freq_var = tk.StringVar(value=str(DEFAULT_SAMP_FREQ))
-        self.buffer_time_ms_var = tk.StringVar(value=str(DEFAULT_BUFFER_TIME_MS))
-        self.threshold_var = tk.StringVar(value=str(DEFAULT_THRESHOLD_NA))
-        self.return_threshold_var = tk.StringVar(value=str(DEFAULT_RETURN_THRESHOLD_NA))
-        self.min_separation_ms_var = tk.StringVar(value=str(DEFAULT_MIN_SEPARATION_MS))
-        self.voltage_mV_var = tk.StringVar(value=str(DEFAULT_VOLTAGE_MV))
-        self.end_at_std_peak_var = tk.BooleanVar(value=DEFAULT_END_AT_STD_PEAK)
-        self.end_std_window_var = tk.StringVar(value=str(DEFAULT_END_STD_WINDOW_MS))
-        self.end_std_height_var = tk.StringVar(value=str(DEFAULT_END_STD_HEIGHT_FACTOR))
-        self.end_std_prominence_var = tk.StringVar(value=str(DEFAULT_END_STD_PROMINENCE))
-        self.end_std_pre_crossing_buffer_fraction_var = tk.StringVar(
-            value=str(DEFAULT_END_STD_PRE_CROSSING_BUFFER_FRACTION)
-        )
-        self.status_var = tk.StringVar(value="Choose an H5 file, then load a preview.")
-
-        self._configure_style()
-        self._build_ui()
-
-    def _configure_style(self) -> None:
-        style = ttk.Style(self.root)
-        try:
-            style.theme_use("clam")
-        except tk.TclError:
-            pass
-
-        style.configure(".", background=BG_COLOR, foreground=TEXT_COLOR)
-        style.configure("TFrame", background=BG_COLOR)
-        style.configure("TLabel", background=BG_COLOR, foreground=TEXT_COLOR)
-        style.configure(
-            "TButton",
-            background=FIELD_COLOR,
-            foreground=TEXT_COLOR,
-            borderwidth=1,
-            focusthickness=0,
-            padding=6,
-            relief="solid",
-        )
-        style.map(
-            "TButton",
-            background=[("active", "#e2e8f0"), ("pressed", "#d7deea")],
-            foreground=[("active", TEXT_COLOR), ("pressed", TEXT_COLOR)],
-        )
-        style.configure(
-            "TEntry",
-            fieldbackground=FIELD_COLOR,
-            foreground=TEXT_COLOR,
-            insertcolor=TEXT_COLOR,
-            bordercolor="#c7d1dd",
-        )
-
-    def _build_ui(self) -> None:
-        controls = ttk.Frame(self.root, padding=12)
-        controls.pack(side=tk.TOP, fill=tk.X)
-
-        row0 = ttk.Frame(controls)
-        row0.pack(side=tk.TOP, anchor="w", fill=tk.X, pady=4)
-        ttk.Label(row0, text="H5 file").pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Entry(row0, textvariable=self.filepath_var, width=100).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(row0, text="Browse", command=self.browse_file).pack(side=tk.LEFT)
-
-        row1 = ttk.Frame(controls)
-        row1.pack(side=tk.TOP, anchor="w", pady=4)
-        acquisition_specs = [
-            ("Sampling (kHz)", self.samp_freq_var),
-            ("Buffer (ms)", self.buffer_time_ms_var),
-            ("Voltage (mV)", self.voltage_mV_var),
-        ]
-        for idx, (label_text, variable) in enumerate(acquisition_specs):
-            if idx > 0:
-                ttk.Label(row1, text="").pack(side=tk.LEFT, padx=(10, 0))
-            ttk.Label(row1, text=label_text).pack(side=tk.LEFT, padx=(0, 8))
-            ttk.Entry(row1, textvariable=variable, width=10).pack(side=tk.LEFT)
-
-        row2 = ttk.Frame(controls)
-        row2.pack(side=tk.TOP, anchor="w", pady=4)
-        threshold_specs = [
-            ("Threshold (nA)", self.threshold_var),
-            ("Return thr. (nA)", self.return_threshold_var),
-            ("Min gap (ms)", self.min_separation_ms_var),
-        ]
-        for idx, (label_text, variable) in enumerate(threshold_specs):
-            if idx > 0:
-                ttk.Label(row2, text="").pack(side=tk.LEFT, padx=(10, 0))
-            ttk.Label(row2, text=label_text).pack(side=tk.LEFT, padx=(0, 8))
-            ttk.Entry(row2, textvariable=variable, width=10).pack(side=tk.LEFT)
-
-        end_group = ttk.Frame(controls)
-        end_group.pack(side=tk.TOP, anchor="w", pady=4)
-        ttk.Checkbutton(end_group, text="End at std peak", variable=self.end_at_std_peak_var).pack(side=tk.LEFT, padx=(0, 16))
-        ttk.Label(end_group, text="Std window (ms)").pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Entry(end_group, textvariable=self.end_std_window_var, width=8).pack(side=tk.LEFT, padx=(0, 16))
-        ttk.Label(end_group, text="Height factor").pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Entry(end_group, textvariable=self.end_std_height_var, width=8).pack(side=tk.LEFT, padx=(0, 16))
-        ttk.Label(end_group, text="Prominence").pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Entry(end_group, textvariable=self.end_std_prominence_var, width=8).pack(side=tk.LEFT, padx=(0, 16))
-        ttk.Label(end_group, text="Pre-cross buffer frac").pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Entry(
-            end_group,
-            textvariable=self.end_std_pre_crossing_buffer_fraction_var,
-            width=8,
-        ).pack(side=tk.LEFT)
-
-        action_row = ttk.Frame(controls)
-        action_row.pack(side=tk.TOP, anchor="w", pady=(8, 4))
-
-        ttk.Button(action_row, text="Load / Reload Preview", command=self.reload_preview).pack(
-            side=tk.LEFT, padx=(0, 8)
-        )
-        ttk.Button(action_row, text="Randomise Selection", command=self.random_preview).pack(
-            side=tk.LEFT, padx=(0, 8)
-        )
-        ttk.Button(action_row, text="Vibration Removal", command=self.vibration_removal).pack(
-            side=tk.LEFT, padx=(0, 8)
-        )
-        ttk.Button(action_row, text="Confirm Threshold", command=self.confirm_threshold).pack(
-            side=tk.LEFT
-        )
-
-        ttk.Label(self.root, textvariable=self.status_var, padding=(12, 0, 12, 8)).pack(side=tk.TOP, fill=tk.X)
-
-        self.figure = Figure(figsize=(16, 9.4), dpi=100, facecolor=BG_COLOR)
-        self.canvas = FigureCanvasTkAgg(self.figure, master=self.root)
-        toolbar_frame = tk.Frame(self.root, bg=TOOLBAR_COLOR, padx=6, pady=4)
-        toolbar_frame.pack(side=tk.TOP, fill=tk.X)
-        self.toolbar = FilteringToolbar(self.canvas, toolbar_frame, pack_toolbar=False)
-        self.toolbar.update()
-        self.toolbar.config(background=TOOLBAR_COLOR, borderwidth=0)
-        self.toolbar._message_label.configure(background=TOOLBAR_COLOR, foreground=TEXT_COLOR)
-        for child in self.toolbar.winfo_children():
-            widget_class = child.winfo_class()
-            if widget_class == "Frame":
-                child.configure(background=TOOLBAR_COLOR, borderwidth=0, highlightthickness=0, relief="flat")
-            elif widget_class == "Label":
-                child.configure(background=TOOLBAR_COLOR, foreground=TEXT_COLOR, borderwidth=0, highlightthickness=0)
-        self.toolbar.pack(side=tk.LEFT, fill=tk.X)
-
-        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
-        self.canvas.get_tk_widget().configure(bg=BG_COLOR, highlightthickness=0)
-
-    def browse_file(self) -> None:
-        path = filedialog.askopenfilename(
-            title="Choose event H5 file",
-            filetypes=[("HDF5 files", "*.h5 *.hdf5"), ("All files", "*.*")],
-        )
+    def dropEvent(self, event):
+        path = dropped_file(event.mimeData())
         if path:
-            self.filepath_var.set(path)
+            event.setDropAction(QtCore.Qt.DropAction.CopyAction)
+            event.accept()
+            self.fileDropped.emit(path)
 
-    def read_settings(self) -> Settings:
-        filepath = self.filepath_var.get().strip()
-        if not filepath:
-            raise ValueError("Please provide an H5 file path.")
-        if not os.path.exists(filepath):
-            raise ValueError(f"File does not exist: {filepath}")
-        pre_crossing_buffer_fraction = float(self.end_std_pre_crossing_buffer_fraction_var.get())
-        if pre_crossing_buffer_fraction < 0:
-            raise ValueError("Pre-cross buffer fraction must be 0 or greater.")
 
-        return Settings(
-            filepath=filepath,
-            samp_freq=float(self.samp_freq_var.get()),
-            buffer_time_ms=float(self.buffer_time_ms_var.get()),
-            threshold_nA=float(self.threshold_var.get()),
-            return_threshold_nA=float(self.return_threshold_var.get()),
-            min_separation_ms=float(self.min_separation_ms_var.get()),
-            voltage_mV=float(self.voltage_mV_var.get()),
-            end_at_std_peak=bool(self.end_at_std_peak_var.get()),
-            end_std_window_ms=float(self.end_std_window_var.get()),
-            end_std_height_factor=float(self.end_std_height_var.get()),
-            end_std_prominence=float(self.end_std_prominence_var.get()),
-            end_std_pre_crossing_buffer_fraction=pre_crossing_buffer_fraction,
-        )
+class DwellTApp(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle('Event Filtering')
+        self.setStyleSheet(APP_STYLE)
+        self.resize(1530, 1000)
+        self.setAcceptDrops(True)
+        self.source = None
+        self.raw_offset = 0
+        self.preview_cache = []
+        self.preview_order_names = []
+        self.focus_names = None
+        self.selected_segment_names = None
+        self.filter_window = None
+        self.active_settings = None
+        self.active_detected_events = []
+        self.active_segment_results = []
+        self.preview_window = None
+        self.child_windows = []
+        self.rng = np.random.default_rng()
+        self.runner = TaskRunner(self)
+        self.runner.busyChanged.connect(self._busy_changed)
+        self.runner.failed.connect(self._failed)
+        configure_plots()
+        self._build_ui()
+        QtWidgets.QApplication.instance().installEventFilter(self)
 
-    def ensure_event_cache(self, settings: Settings) -> None:
-        if settings.filepath == self.cached_filepath and self.available_event_names:
+    def _build_ui(self):
+        splitter = QtWidgets.QSplitter()
+        self.setCentralWidget(splitter)
+        left_scroll = QtWidgets.QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setMinimumWidth(290)
+        self.controls = QtWidgets.QWidget()
+        left_scroll.setWidget(self.controls)
+        left = QtWidgets.QVBoxLayout(self.controls)
+        left.setSpacing(12)
+        title = QtWidgets.QLabel('Event Filtering')
+        title.setStyleSheet('font-size: 22px; font-weight: 600; color: #24415c;')
+        left.addWidget(title)
+        self.fields = {}
+        self.file_box = QtWidgets.QGroupBox('File and acquisition')
+        file_layout = QtWidgets.QVBoxLayout(self.file_box)
+        self.drop_area = DropArea()
+        self.drop_area.fileDropped.connect(self.load_file)
+        file_layout.addWidget(self.drop_area)
+        self.path_field = QtWidgets.QLineEdit()
+        self.path_field.setPlaceholderText('Or paste an H5 file path')
+        self.path_field.setAcceptDrops(True)
+        self.path_timer = QtCore.QTimer(self)
+        self.path_timer.setSingleShot(True)
+        self.path_timer.setInterval(500)
+        self.path_timer.timeout.connect(self._load_pasted_path)
+        self.path_field.textChanged.connect(lambda: self.path_timer.start())
+        self.path_field.returnPressed.connect(self._load_pasted_path)
+        file_layout.addWidget(self.path_field)
+        self.browse_button = button('Browse…', self.browse_file, file_layout)
+        acquisition = QtWidgets.QFormLayout()
+        acquisition.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapLongRows)
+        for key, label, default, minimum in [
+            ('samp_freq', 'Sampling (kHz)', analysis.DEFAULT_SAMP_FREQ, 0.001),
+            ('buffer_time_ms', 'Buffer (ms)', analysis.DEFAULT_BUFFER_TIME_MS, 0.0001),
+        ]:
+            field = number_field(default, minimum=minimum)
+            self.fields[key] = field
+            acquisition.addRow(label, field)
+            field.valueChanged.connect(self.invalidate_analysis)
+        self.fields['samp_freq'].valueChanged.connect(self._refresh_raw)
+        file_layout.addLayout(acquisition)
+        left.addWidget(self.file_box)
+        voltage_box = self.voltage_box = QtWidgets.QGroupBox('Voltage')
+        voltage_layout = QtWidgets.QVBoxLayout(voltage_box)
+        self.ao_status = QtWidgets.QLabel('Drop a file to look for its companion AO log.')
+        self.ao_status.setWordWrap(True)
+        voltage_layout.addWidget(self.ao_status)
+        self.voltage_list = QtWidgets.QListWidget()
+        self.voltage_list.setMaximumHeight(145)
+        self.voltage_list.hide()
+        self.voltage_list.itemChanged.connect(self._voltage_changed)
+        voltage_layout.addWidget(self.voltage_list)
+        self.manual_voltage = QtWidgets.QCheckBox('Use manual voltage')
+        self.manual_voltage.setChecked(True)
+        voltage_layout.addWidget(self.manual_voltage)
+        self.voltage_field = number_field(analysis.DEFAULT_VOLTAGE_MV, minimum=-1e6, maximum=1e6, decimals=2)
+        self.voltage_field.setMaximumWidth(16777215)
+        self.voltage_field.setSuffix(' mV')
+        voltage_layout.addWidget(self.voltage_field)
+        self.manual_voltage.toggled.connect(self.voltage_field.setEnabled)
+        self.manual_voltage.toggled.connect(self.invalidate_analysis)
+        self.voltage_field.valueChanged.connect(self.invalidate_analysis)
+        self.save_voltages_button = button('Save selected voltages…', self.save_selected_voltages, voltage_layout)
+        left.addWidget(voltage_box)
+        settings_box = QtWidgets.QGroupBox('Detection settings')
+        form = QtWidgets.QFormLayout(settings_box)
+        form.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapLongRows)
+        for key, label, default, minimum in [
+            ('threshold_nA', 'Threshold (nA)', analysis.DEFAULT_THRESHOLD_NA, 0.0001),
+            ('return_threshold_nA', 'Return threshold (nA)', analysis.DEFAULT_RETURN_THRESHOLD_NA, 0.0),
+            ('min_separation_ms', 'Min gap (ms)', analysis.DEFAULT_MIN_SEPARATION_MS, 0.0),
+        ]:
+            field = number_field(default, minimum=minimum)
+            self.fields[key] = field
+            form.addRow(label, field)
+            field.valueChanged.connect(self.invalidate_analysis)
+        left.addWidget(settings_box)
+        self.std_box = QtWidgets.QGroupBox('End at std peak')
+        self.std_box.setCheckable(True)
+        self.std_box.setChecked(analysis.DEFAULT_END_AT_STD_PEAK)
+        std_form = QtWidgets.QFormLayout(self.std_box)
+        std_form.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapLongRows)
+        for key, label, default in [
+            ('end_std_window_ms', 'Std window (ms)', analysis.DEFAULT_END_STD_WINDOW_MS),
+            ('end_std_height_factor', 'Height factor', analysis.DEFAULT_END_STD_HEIGHT_FACTOR),
+            ('end_std_prominence', 'Prominence', analysis.DEFAULT_END_STD_PROMINENCE),
+            ('end_std_pre_crossing_buffer_fraction', 'Pre-cross fraction', analysis.DEFAULT_END_STD_PRE_CROSSING_BUFFER_FRACTION),
+        ]:
+            field = number_field(default)
+            self.fields[key] = field
+            std_form.addRow(label, field)
+            field.valueChanged.connect(self.invalidate_analysis)
+        self.std_box.toggled.connect(self.invalidate_analysis)
+        left.addWidget(self.std_box)
+        self.preview_controls = QtWidgets.QGroupBox('Event previews')
+        preview_controls = QtWidgets.QVBoxLayout(self.preview_controls)
+        preview_controls.addWidget(QtWidgets.QLabel('Preview order'))
+        self.preview_order = QtWidgets.QComboBox()
+        self.preview_order.addItems(['Chronological', 'Random'])
+        self.preview_order.currentTextChanged.connect(self._preview_order_changed)
+        preview_controls.addWidget(self.preview_order)
+        self.all_events_button = button('All events', self.show_all_events, preview_controls)
+        self.randomize_button = button('Randomise', self.randomize_previews, preview_controls)
+        navigation = QtWidgets.QHBoxLayout()
+        self.previous_button = button('Previous', lambda: self.change_raw_page(-6), navigation)
+        self.next_button = button('Next', lambda: self.change_raw_page(6), navigation)
+        preview_controls.addLayout(navigation)
+        left.addWidget(self.preview_controls)
+        self.analyze_button = button('Analyze selected voltages', lambda: self.run_analysis(force=True), left)
+        self.analyze_button.setStyleSheet('background: #277d94; color: white; font-weight: 600; padding: 9px;')
+        self.preview_button = button('Preview segments…', lambda: self.run_analysis(self.show_segment_preview), left)
+        self.vibration_button = button('Vibration removal…', self.vibration_removal, left)
+        self.filter_button = button('Filter / save segments…', self.confirm_threshold, left)
+        left.addStretch()
+        splitter.addWidget(left_scroll)
+        right_scroll = QtWidgets.QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right = QtWidgets.QWidget()
+        right_scroll.setWidget(right)
+        right_layout = QtWidgets.QVBoxLayout(right)
+        raw_header = QtWidgets.QHBoxLayout()
+        self.raw_label = QtWidgets.QLabel('Raw events · drop a file to preview')
+        self.raw_label.setStyleSheet('font-size: 16px; font-weight: 600;')
+        raw_header.addWidget(self.raw_label, 1)
+        right_layout.addLayout(raw_header)
+        self.raw_grid = TraceGrid(rows=2)
+        self.raw_grid.setMinimumHeight(420)
+        right_layout.addWidget(self.raw_grid)
+        self.summary_label = QtWidgets.QLabel('Segment metrics · run analysis when ready')
+        self.summary_label.setStyleSheet('font-size: 16px; font-weight: 600;')
+        right_layout.addWidget(self.summary_label)
+        self.recording_start_label = QtWidgets.QLabel('Recording started — s after acquisition.')
+        self.recording_start_label.setWordWrap(True)
+        self.recording_start_label.setToolTip('Timestamp of the synthetic start event, in seconds.')
+        right_layout.addWidget(self.recording_start_label)
+        explanation = QtWidgets.QLabel('Click or box-select time points to preview events; Shift/⌘/Ctrl adds events. Lighter dots are previewed. Each pair shares a value axis, initially showing the central 99%.')
+        explanation.setWordWrap(True)
+        right_layout.addWidget(explanation)
+        self.summary = SummaryPlots()
+        self.summary.eventsSelected.connect(self.preview_plot_events)
+        self.summary.setMinimumHeight(820)
+        right_layout.addWidget(self.summary)
+        splitter.addWidget(right_scroll)
+        splitter.setSizes([360, 1170])
+        splitter.setStretchFactor(1, 1)
+        self.statusBar().showMessage('Drop an event H5 file from Finder, paste a path, or choose Browse.')
+        self._update_actions()
+
+    def eventFilter(self, watched, event):
+        if (isinstance(watched, QtWidgets.QWidget) and
+                (watched is self or self.isAncestorOf(watched)) and
+                event.type() in (QtCore.QEvent.Type.DragEnter, QtCore.QEvent.Type.DragMove, QtCore.QEvent.Type.Drop)):
+            path = dropped_file(event.mimeData())
+            if path and not self.runner.busy:
+                event.setDropAction(QtCore.Qt.DropAction.CopyAction)
+                event.accept()
+                if event.type() == QtCore.QEvent.Type.Drop:
+                    self.load_file(path)
+                return True
+        return super().eventFilter(watched, event)
+
+    def dragEnterEvent(self, event):
+        if not self.runner.busy and dropped_file(event.mimeData()):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        path = dropped_file(event.mimeData())
+        if path and not self.runner.busy:
+            event.setDropAction(QtCore.Qt.DropAction.CopyAction)
+            event.accept()
+            self.load_file(path)
+
+    def _load_pasted_path(self):
+        path = self.path_field.text().strip().strip("\"'")
+        url = QtCore.QUrl(path)
+        if url.isLocalFile():
+            path = url.toLocalFile()
+        if Path(path).expanduser().is_file() and (not self.source or str(Path(path).expanduser().resolve()) != self.source.filepath):
+            self.load_file(path)
+
+    def browse_file(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Choose event H5 file', '', 'HDF5 files (*.h5 *.hdf5)')
+        if path:
+            self.load_file(path)
+
+    def load_file(self, path):
+        if self.runner.busy:
             return
+        self.path_timer.stop()
+        self.source = None
+        self.recording_start_label.setText('Recording started — s after acquisition.')
+        self.raw_offset = 0
+        self.preview_cache = []
+        self.preview_order_names = []
+        self.focus_names = None
+        self.invalidate_analysis()
+        self.raw_grid.display([], self.fields['samp_freq'].value())
+        self.raw_label.setText('Loading raw events…')
+        self.voltage_list.blockSignals(True)
+        self.voltage_list.clear()
+        self.voltage_list.hide()
+        self.voltage_list.blockSignals(False)
+        self.path_field.blockSignals(True)
+        self.path_field.setText(str(path))
+        self.path_field.setToolTip(str(path))
+        self.path_field.blockSignals(False)
+        self.ao_status.setText('Looking for a companion AO file…')
+        self.statusBar().showMessage('Loading raw events; no segment detection is running…')
+        self.runner.start(lambda: inspect_file(path), self._file_loaded)
 
-        self.first_event_name, self.available_event_names = list_event_names(settings.filepath)
-        self.cached_filepath = settings.filepath
-        self.current_preview_names = []
-
-        if not self.available_event_names:
-            raise ValueError("The file only contains the synthetic start event; there is nothing to preview.")
-
-    def settings_cache_key(self, settings: Settings) -> tuple:
-        return (
-            settings.filepath,
-            settings.samp_freq,
-            settings.buffer_time_ms,
-            settings.threshold_nA,
-            settings.return_threshold_nA,
-            settings.min_separation_ms,
-            settings.voltage_mV,
-            settings.end_at_std_peak,
-            settings.end_std_window_ms,
-            settings.end_std_height_factor,
-            settings.end_std_prominence,
-            settings.end_std_pre_crossing_buffer_fraction,
-        )
-
-    def get_cached_results(self, settings: Settings) -> tuple[list, list[SegmentResult]]:
-        cache_key = self.settings_cache_key(settings)
-        if self.cached_settings_key != cache_key or self.cached_detected_events is None:
-            self.cached_detected_events = iter_detected_events(settings)
-            self.cached_segment_results = collect_segment_results(
-                settings,
-                detected_events=self.cached_detected_events,
+    def _file_loaded(self, source):
+        self.source = source
+        timestamp = source.timestamps.get(source.anchor)
+        if timestamp is None:
+            valid_times = [value for value in source.timestamps.values() if value is not None]
+            first_time = f'{min(valid_times):.6f}' if valid_times else 'unknown'
+            self.recording_start_label.setText(
+                f'No synthetic event found. First event {first_time} s after acquisition started.'
             )
-            self.cached_settings_key = cache_key
-        return self.cached_detected_events, self.cached_segment_results
-
-    def reset_active_results(self, settings: Settings) -> None:
-        detected_events, _ = self.get_cached_results(settings)
-        self.active_detected_events = copy.deepcopy(detected_events)
-        self.active_segment_results = collect_segment_results(
-            settings,
-            detected_events=self.active_detected_events,
-        )
-
-    def render_active_previews(self, settings: Settings) -> None:
-        previews = load_previews_from_events(
-            settings,
-            self.active_detected_events,
-            event_names=self.current_preview_names,
-        )
-        self.render_previews(previews, settings, self.active_segment_results)
-
-    def choose_random_preview_names(self) -> list[str]:
-        sample_size = min(PREVIEW_COUNT, len(self.available_event_names))
-        if sample_size == 0:
-            return []
-        idx = self.rng.choice(len(self.available_event_names), size=sample_size, replace=False)
-        return [self.available_event_names[i] for i in sorted(idx)]
-
-    def reload_preview(self) -> None:
-        try:
-            settings = self.read_settings()
-            self.ensure_event_cache(settings)
-            self.reset_active_results(settings)
-            if not self.current_preview_names:
-                self.current_preview_names = self.choose_random_preview_names()
-            self.render_active_previews(settings)
-        except Exception as exc:
-            messagebox.showerror("Preview failed", str(exc))
-
-    def random_preview(self) -> None:
-        try:
-            settings = self.read_settings()
-            self.ensure_event_cache(settings)
-            if not self.active_detected_events:
-                self.reset_active_results(settings)
-            self.current_preview_names = self.choose_random_preview_names()
-            self.render_active_previews(settings)
-        except Exception as exc:
-            messagebox.showerror("Preview failed", str(exc))
-
-    def vibration_removal(self) -> None:
-        try:
-            settings = self.read_settings()
-            self.ensure_event_cache(settings)
-            if not self.active_detected_events:
-                self.reset_active_results(settings)
-            VibrationRemovalWindow(
-                parent=self.root,
-                settings=settings,
-                source_events=copy.deepcopy(self.active_detected_events),
-                apply_callback=lambda events, keep_window: self.apply_vibration_results(settings, events),
-            )
-        except Exception as exc:
-            messagebox.showerror("Vibration Removal", str(exc))
-
-    def apply_vibration_results(self, settings: Settings, events: list[DetectedEvent]) -> None:
-        self.active_detected_events = events
-        self.active_segment_results = collect_segment_results(
-            settings,
-            detected_events=self.active_detected_events,
-        )
-        self.render_active_previews(settings)
-
-    def _adaptive_bins(self, values: np.ndarray) -> int | str:
-        if values.size < 2:
-            return 1
-        q25, q75 = np.percentile(values, [25, 75])
-        iqr = q75 - q25
-        if iqr <= 0:
-            return min(20, max(5, int(np.sqrt(values.size))))
-        bin_width = 2 * iqr * np.power(values.size, -1 / 3)
-        if bin_width <= 0:
-            return "auto"
-        data_range = values.max() - values.min()
-        if data_range <= 0:
-            return 1
-        return max(1, int(np.ceil(data_range / bin_width)))
-
-    def _robust_hist_values(self, values: np.ndarray) -> tuple[np.ndarray, tuple[float, float] | None]:
-        finite = values[np.isfinite(values)]
-        if finite.size == 0:
-            return finite, None
-        if finite.size < 8:
-            lo = float(finite.min())
-            hi = float(finite.max())
         else:
-            lo, hi = np.percentile(finite, [1, 99])
-            if not np.isfinite(lo) or not np.isfinite(hi) or lo == hi:
-                lo = float(finite.min())
-                hi = float(finite.max())
-        if lo == hi:
-            pad = abs(lo) * 0.05 if lo != 0 else 0.5
-            lo -= pad
-            hi += pad
-        display = finite[(finite >= lo) & (finite <= hi)]
-        if display.size == 0:
-            display = finite
-            lo = float(finite.min())
-            hi = float(finite.max())
-        return display, (float(lo), float(hi))
+            self.recording_start_label.setText(f'Recording started {timestamp:.6f} s after acquisition.')
+        self.preview_order_names = list(source.event_names)
+        self._display_raw(source.previews)
+        self.statusBar().showMessage('Raw events loaded. Checking AO voltages…')
+        self.runner.start(lambda: prepare_voltage_groups(source), self._voltage_ready)
 
-    def _style_axis(self, ax) -> None:
-        ax.set_facecolor(PANEL_COLOR)
-        for spine in ax.spines.values():
-            spine.set_color(MUTED_COLOR)
-        ax.tick_params(colors=MUTED_COLOR, labelsize=TICK_LABELSIZE)
-        ax.xaxis.label.set_color(TEXT_COLOR)
-        ax.yaxis.label.set_color(TEXT_COLOR)
-        ax.xaxis.label.set_size(AXIS_LABEL_FONTSIZE)
-        ax.yaxis.label.set_size(AXIS_LABEL_FONTSIZE)
-        ax.title.set_color(TEXT_COLOR)
+    def _voltage_ready(self, source):
+        self.source = source
+        self.ao_status.setText(source.voltage_message)
+        self.voltage_list.blockSignals(True)
+        for voltage, names in source.voltage_groups.items():
+            item = QtWidgets.QListWidgetItem(f'{voltage:+g} mV · {len(names)} events')
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, voltage)
+            item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(QtCore.Qt.CheckState.Checked)
+            self.voltage_list.addItem(item)
+        self.voltage_list.blockSignals(False)
+        self.manual_voltage.setChecked(not bool(source.voltage_groups))
+        self.voltage_list.setVisible(bool(source.voltage_groups))
+        self.manual_voltage.setEnabled(bool(source.voltage_groups))
+        self.voltage_field.setEnabled(self.manual_voltage.isChecked())
+        self.statusBar().showMessage(f'{len(source.event_names)} raw events loaded. Synthetic start event excluded. No segment detection has run.')
+        self._rebuild_preview_order()
+        self._refresh_raw()
+        self._update_actions()
 
-    def _plot_std_overlay(self, ax, std_time_ms: np.ndarray, std_trace: np.ndarray, std_threshold: float) -> None:
-        if std_trace.size == 0:
+    def selected_voltages(self):
+        return {self.voltage_list.item(i).data(QtCore.Qt.ItemDataRole.UserRole)
+                for i in range(self.voltage_list.count())
+                if self.voltage_list.item(i).checkState() == QtCore.Qt.CheckState.Checked}
+
+    def save_selected_voltages(self):
+        if self.runner.busy or not self.source or not self.selected_voltages():
             return
-        y_min, y_max = ax.get_ylim()
-        y_span = y_max - y_min
-        if y_span <= 0:
+        directory = QtWidgets.QFileDialog.getExistingDirectory(self, 'Save voltage files in', str(Path(self.source.filepath).parent))
+        if not directory:
             return
-        std_top = max(float(np.max(std_trace)), std_threshold)
-        if std_top <= 0:
+        source, voltages = self.source, self.selected_voltages()
+        self.statusBar().showMessage('Saving selected voltage recordings…')
+        def ready(paths):
+            source.split_paths.extend(paths)
+            self.statusBar().showMessage(f'Saved {len(paths)} voltage files in {directory}')
+        self.runner.start(lambda: write_voltage_splits(source, voltages, directory), ready)
+
+    def selected_names(self):
+        if not self.source:
+            return []
+        if not self.source.voltage_groups:
+            return self.source.event_names
+        voltages = {self.voltage_list.item(i).data(QtCore.Qt.ItemDataRole.UserRole)
+                    for i in range(self.voltage_list.count())
+                    if self.voltage_list.item(i).checkState() == QtCore.Qt.CheckState.Checked}
+        return [name for name in self.source.event_names if self.source.event_voltages_mV[name] in voltages]
+
+    def _voltage_changed(self, *_):
+        self.focus_names = None
+        self._rebuild_preview_order()
+        self.invalidate_analysis()
+        self._refresh_raw()
+
+    def _rebuild_preview_order(self):
+        available = self.selected_names()
+        available_set = set(available)
+        names = available if self.focus_names is None else [name for name in self.focus_names if name in available_set]
+        if self.preview_order.currentText() == 'Random':
+            names = list(self.rng.permutation(names))
+        elif self.source:
+            names = sorted(names, key=lambda name: (self.source.timestamps[name] is None,
+                                                    self.source.timestamps[name] or 0.0))
+        self.preview_order_names = names
+        self.raw_offset = 0
+
+    def _preview_order_changed(self, *_):
+        self._rebuild_preview_order()
+        self._refresh_raw()
+
+    def randomize_previews(self):
+        if self.runner.busy:
             return
-        overlay_base = y_min + 0.06 * y_span
-        overlay_height = 0.24 * y_span
-        scaled_std = overlay_base + (std_trace / std_top) * overlay_height
-        ax.plot(
-            std_time_ms,
-            scaled_std,
-            color=STD_PEAK_COLOR,
-            alpha=0.7,
-            linewidth=0.9,
-            zorder=8,
-        )
-        if std_threshold > 0:
-            scaled_threshold = overlay_base + (std_threshold / std_top) * overlay_height
-            ax.axhline(
-                scaled_threshold,
-                color="#b388ff",
-                alpha=0.75,
-                linestyle="--",
-                linewidth=0.8,
-                zorder=9,
-            )
+        self.preview_order.blockSignals(True)
+        self.preview_order.setCurrentText('Random')
+        self.preview_order.blockSignals(False)
+        self._preview_order_changed()
 
-    def _render_histograms(self, hist_axes: list, segment_results: list[SegmentResult]) -> None:
-        metrics = [
-            ("Dwell t (ms)", np.array([r.dwell_time_ms for r in segment_results], dtype=float)),
-            ("EC (nA ms)", np.array([r.area_nA_ms for r in segment_results], dtype=float)),
-            ("Relative  \u0394I", np.array([r.delta_I_rel for r in segment_results], dtype=float)),
-            ("R (MOhm)", np.array([r.resistance_MOhm for r in segment_results], dtype=float)),
-        ]
+    def show_all_events(self):
+        if self.runner.busy:
+            return
+        self.focus_names = None
+        self._preview_order_changed()
 
-        for ax, (label, values) in zip(hist_axes, metrics):
-            self._style_axis(ax)
-            display, xlim = self._robust_hist_values(values)
-            if display.size == 0:
-                ax.text(
-                    0.5, 0.5, "no data", transform=ax.transAxes, ha="center", va="center",
-                color=MUTED_COLOR, fontsize=SEGMENT_LABEL_FONTSIZE
-                )
-                ax.set_title("")
-                continue
-            ax.hist(display, bins=self._adaptive_bins(display), color=HIST_BAR_COLOR, alpha=0.8, edgecolor="#eef2f7")
-            if xlim is not None:
-                ax.set_xlim(*xlim)
-            ax.set_title("")
-            ax.set_ylabel("Count")
-            ax.set_xlabel(label)
-            ax.xaxis.set_label_position("bottom")
-            ax.tick_params(axis="x", labelbottom=True, labeltop=False, bottom=True, top=False)
+    def preview_plot_events(self, names, additive=False):
+        if self.runner.busy or not self.source:
+            return
+        available = set(self.selected_names())
+        selected = (self.focus_names or []) if additive else []
+        self.focus_names = list(dict.fromkeys([*selected, *(name for name in names if name in available)]))
+        self._rebuild_preview_order()
+        self._refresh_raw()
 
-        for ax in hist_axes:
-            ax.xaxis.set_label_position("bottom")
-            ax.tick_params(axis="x", labelbottom=True, labeltop=False, bottom=True, top=False)
+    def change_raw_page(self, step):
+        self.raw_offset = max(0, self.raw_offset + step)
+        self._refresh_raw()
 
-    def render_previews(
-        self,
-        previews: list[EventPreview],
-        settings: Settings,
-        segment_results: list[SegmentResult],
-    ) -> None:
-        self.figure.clear()
-        n_rows, n_cols = 4, 3
-        gs = self.figure.add_gridspec(
-            nrows=n_rows,
-            ncols=4,
-            width_ratios=[1.0, 1.0, 1.0, 1.5],
-            wspace=0.24,
-            hspace=0.30,
-        )
-        axes = [self.figure.add_subplot(gs[row, col]) for row in range(n_rows) for col in range(n_cols)]
-        hist_axes = [self.figure.add_subplot(gs[row, 3]) for row in range(n_rows)]
+    def _refresh_raw(self, *_):
+        if not self.source or self.runner.busy:
+            return
+        names = self.preview_order_names[self.raw_offset:self.raw_offset + 12]
+        path = self.source.filepath
+        self.runner.start(lambda: read_raw_previews(path, names), self._display_raw)
 
-        for idx, (ax, preview) in enumerate(zip(axes, previews)):
-            row = idx // n_cols
-            col = idx % n_cols
-            self._style_axis(ax)
+    def _display_raw(self, previews):
+        self.preview_cache = previews
+        self.raw_grid.display(previews[:6], self.fields['samp_freq'].value())
+        total = len(self.preview_order_names)
+        scope = 'selected events' if self.focus_names is not None else 'events'
+        self.raw_label.setText(f'Raw {scope} · {self.raw_offset + 1 if previews else 0}–{self.raw_offset + min(6, len(previews))} of {total}')
+        self._render_example()
+        self._sync_preview_highlights()
+        self._update_actions()
 
-            time_ms = np.arange(len(preview.data)) / settings.samp_freq
-            ax.plot(time_ms, preview.data, color=TRACE_COLOR, linewidth=0.8)
-            match = re.search(r"(\d+)$", preview.event_name)
-            event_label = f"Event {int(match.group(1))}" if match else preview.event_name
+    def _example_previews(self):
+        events = {event.event_name: event for event in self.active_detected_events}
+        previews = []
+        for raw in self.preview_cache:
+            event = events.get(raw.event_name)
+            segments = []
+            if event:
+                for index, segment in enumerate(event.segments):
+                    name = event.event_name if index == 0 else f'{event.event_name}_{index}'
+                    if self.selected_segment_names is None or name in self.selected_segment_names:
+                        segments.append(segment)
+            previews.append(replace(raw, baseline=event.baseline if event else 0.0, segments=segments))
+        return previews
 
-            if preview.segments:
-                dwell_labels = []
-                for segment_info in preview.segments:
-                    colour = POS_HIGHLIGHT_COLOR if segment_info.direction == 1 else NEG_HIGHLIGHT_COLOR
-                    line_start = max(0.0, (segment_info.start / settings.samp_freq) - LINE_EXTENSION_MS)
-                    line_end = min(time_ms[-1], (segment_info.end / settings.samp_freq) + LINE_EXTENSION_MS)
-                    ax.axvspan(
-                        segment_info.start / settings.samp_freq,
-                        segment_info.end / settings.samp_freq,
-                        color=colour,
-                        alpha=0.12,
-                    )
-                    ax.hlines(
-                        segment_info.baseline,
-                        line_start,
-                        line_end,
-                        colors=BASELINE_COLOR,
-                        linestyles="--",
-                        linewidth=1.0,
-                    )
-                    threshold_value = threshold_guide_value(
-                        segment_info.baseline,
-                        segment_info.direction,
-                        settings.threshold_nA,
-                    )
-                    ax.hlines(
-                        threshold_value,
-                        line_start,
-                        line_end,
-                        colors=BEGIN_THRESHOLD_COLOR,
-                        linestyles="--",
-                        linewidth=0.9,
-                    )
-                    return_threshold_value = threshold_guide_value(
-                        segment_info.baseline,
-                        segment_info.direction,
-                        settings.return_threshold_nA,
-                    )
-                    ax.hlines(
-                        return_threshold_value,
-                        line_start,
-                        line_end,
-                        colors=RETURN_THRESHOLD_COLOR,
-                        linestyles="--",
-                        linewidth=0.9,
-                    )
-                    dwell_ms = (segment_info.end - segment_info.start + 1) / settings.samp_freq
-                    dwell_labels.append(f"{dwell_ms:.2f} ms")
-                segment_label = ", ".join(dwell_labels)
-            else:
-                segment_label = "no event"
+    def _render_example(self):
+        if self.preview_window is not None:
+            self.preview_window.grid.display(self._example_previews(), self.fields['samp_freq'].value(), self.active_settings)
 
-            if time_ms.size:
-                ax.set_xlim(-FULL_TRACE_XPAD_MS, float(time_ms[-1] + FULL_TRACE_XPAD_MS))
-                y_min = float(np.min(preview.data))
-                y_max = float(np.max(preview.data))
-                y_span = y_max - y_min
-                y_pad = max(0.03, FULL_TRACE_YPAD_FRAC * y_span if y_span > 0 else 0.05 * max(abs(y_max), 1.0))
-                ax.set_ylim(y_min - y_pad, y_max + y_pad)
+    def _sync_preview_highlights(self, *_):
+        count = 12 if self.preview_window is not None and self.preview_window.isVisible() else 6
+        self.summary.highlight_events([preview.event_name for preview in self.preview_cache[:count]])
 
-            if settings.end_at_std_peak and preview.segments:
-                overlay_segment = preview.segments[0]
-                std_time_ms, std_trace, std_threshold = get_segment_end_std_overlay(
-                    preview.data,
-                    overlay_segment,
-                    settings,
-                )
-                self._plot_std_overlay(ax, std_time_ms, std_trace, std_threshold)
+    def _reset_filter(self):
+        if self.filter_window is not None:
+            self.filter_window.close()
+            self.filter_window = None
+        self.selected_segment_names = None
+        self.summary.set_selection(None)
 
-            ax.text(
-                0.03,
-                0.95,
-                event_label,
-                transform=ax.transAxes,
-                ha="left",
-                va="top",
-                color=TEXT_COLOR,
-                fontsize=EVENT_LABEL_FONTSIZE,
-                fontweight="bold",
-                bbox={"facecolor": BG_COLOR, "alpha": 0.55, "edgecolor": "none", "pad": 2.5},
-                zorder=20,
-            )
-            ax.text(
-                0.03,
-                0.08,
-                segment_label,
-                transform=ax.transAxes,
-                ha="left",
-                va="bottom",
-                color=TEXT_COLOR,
-                fontsize=SEGMENT_LABEL_FONTSIZE,
-                bbox={"facecolor": BG_COLOR, "alpha": 0.55, "edgecolor": "none", "pad": 2.5},
-                zorder=20,
-            )
-            ax.set_xlabel("Time (ms)" if row == n_rows - 1 else "")
-            ax.set_ylabel("Current (nA)" if col == 0 else "")
-
-        for ax in axes[len(previews):]:
-            ax.axis("off")
-
-        self._render_histograms(hist_axes, segment_results)
-        self.figure.subplots_adjust(left=0.04, right=0.99, top=0.985, bottom=0.06)
-        self.canvas.draw()
-
-        first_note = ""
-        if self.first_event_name:
-            first_note = f" Synthetic start event '{self.first_event_name}' is excluded."
-        self.status_var.set(
-            f"Previewing {len(previews)} traces from {len(self.available_event_names)} events; "
-            f"{len(segment_results)} detected segments in current threshold.{first_note}"
+    def read_settings(self):
+        if not self.source:
+            raise ValueError('Drop or choose an event file first.')
+        names = self.selected_names()
+        if not names:
+            raise ValueError('Select at least one voltage containing recorded events.')
+        return analysis.Settings(
+            filepath=self.source.filepath, voltage_mV=self.voltage_field.value(),
+            event_names=tuple(names),
+            event_voltages_mV={} if self.manual_voltage.isChecked() else dict(self.source.event_voltages_mV),
+            end_at_std_peak=self.std_box.isChecked(),
+            **{key: field.value() for key, field in self.fields.items()},
         )
 
-    def confirm_threshold(self) -> None:
+    def invalidate_analysis(self, *_):
+        self._reset_filter()
+        self.active_settings = None
+        self.active_detected_events = []
+        self.active_segment_results = []
+        if hasattr(self, 'summary'):
+            self.summary.display([], self.source.time_origin if self.source else 0)
+            self.summary_label.setText('Segment metrics · run analysis with the current settings')
+            self._render_example()
+            self._sync_preview_highlights()
+            self._update_actions()
+
+    def run_analysis(self, after=None, force=False):
+        if self.runner.busy:
+            return
         try:
             settings = self.read_settings()
-            self.ensure_event_cache(settings)
-            self.status_var.set("Opening segment filtering stage...")
-            self.root.update_idletasks()
-            if not self.active_detected_events:
-                self.reset_active_results(settings)
-            SegmentFilterWindow(
-                parent=self.root,
-                settings=settings,
-                detected_events=copy.deepcopy(self.active_detected_events),
-                segment_results=copy.deepcopy(self.active_segment_results),
-            )
-        except Exception as exc:
-            messagebox.showerror("Filtering stage", str(exc))
+        except ValueError as exc:
+            self._failed(str(exc))
+            return
+        if not force and settings == self.active_settings:
+            if after:
+                after()
+            return
+        self._reset_filter()
+        self.statusBar().showMessage(f'Detecting segments in {len(settings.event_names)} events…')
+
+        def analyze():
+            events = analysis.iter_detected_events(settings)
+            return events, analysis.collect_segment_results(settings, events)
+
+        def ready(result):
+            self.active_settings = settings
+            self.active_detected_events, self.active_segment_results = result
+            self._display_results()
+            if after:
+                after()
+
+        self.runner.start(analyze, ready)
+
+    def _display_results(self):
+        mapping = {event.event_name if i == 0 else f'{event.event_name}_{i}': event.event_name
+                   for event in self.active_detected_events for i, _ in enumerate(event.segments)}
+        self.summary.display(self.active_segment_results, self.source.time_origin, mapping)
+        self._render_example()
+        self._sync_preview_highlights()
+        self.summary_label.setText(f'Segment metrics · {len(self.active_segment_results)} segments')
+        self.statusBar().showMessage(f'Analysis complete: {len(self.active_segment_results)} segments in {len(self.active_detected_events)} events.')
+        self._update_actions()
+
+    def show_segment_preview(self):
+        if not self.active_settings or self.runner.busy:
+            return
+        if self.preview_window is None:
+            self.preview_window = SegmentPreviewWindow(self, self.active_settings,
+                                                       self._example_previews())
+            self.preview_window.finished.connect(self._sync_preview_highlights)
+        self._render_example()
+        self.preview_window.show()
+        self.preview_window.raise_()
+        self._sync_preview_highlights()
+
+    def vibration_removal(self):
+        if not self.active_settings:
+            return
+        settings = copy.deepcopy(self.active_settings)
+
+        def apply(events, keep_window=False):
+            def ready(results):
+                self.active_detected_events = events
+                self.active_segment_results = results
+                self._reset_filter()
+                self._display_results()
+            self.statusBar().showMessage('Updating metrics after vibration removal…')
+            self.runner.start(lambda: analysis.collect_segment_results(settings, events), ready)
+
+        window = VibrationRemovalWindow(self, settings, self.active_detected_events, apply)
+        window.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+        self.child_windows.append(window)
+        window.show()
+
+    def confirm_threshold(self):
+        if self.active_settings:
+            self._reset_filter()
+            window = SegmentFilterWindow(self, copy.deepcopy(self.active_settings),
+                                         copy.deepcopy(self.active_detected_events),
+                                         copy.deepcopy(self.active_segment_results))
+            self.filter_window = window
+            self.selected_segment_names = set()
+            window.selectionChanged.connect(lambda names: self._filter_selection_changed(window, names))
+            window.finished.connect(lambda _: self._filter_closed(window))
+            self.summary.set_selection(set())
+            self._render_example()
+            self.child_windows.append(window)
+            window.show()
+
+    def _filter_selection_changed(self, window, names):
+        if window is self.filter_window:
+            self.selected_segment_names = set(names)
+            self.summary.set_selection(self.selected_segment_names)
+            self._render_example()
+
+    def _filter_closed(self, window):
+        if window is self.filter_window:
+            self.filter_window = None
+            self.selected_segment_names = None
+            self.summary.set_selection(None)
+            self._render_example()
+
+    def _update_actions(self):
+        busy = self.runner.busy
+        available = bool(self.selected_names())
+        self.analyze_button.setEnabled(available and not busy)
+        self.preview_button.setEnabled(available and not busy)
+        self.vibration_button.setEnabled(self.active_settings is not None and bool(self.active_segment_results) and not busy)
+        self.filter_button.setEnabled(self.active_settings is not None and bool(self.active_segment_results) and not busy)
+        self.save_voltages_button.setEnabled(bool(self.source and self.source.voltage_groups and self.selected_voltages()) and not busy)
+        self.previous_button.setEnabled(self.raw_offset > 0 and not busy)
+        self.next_button.setEnabled(self.raw_offset + 6 < len(self.preview_order_names) and not busy)
+
+    def _busy_changed(self, busy):
+        self.controls.setEnabled(not busy)
+        self.preview_order.setEnabled(not busy)
+        self.all_events_button.setEnabled(not busy)
+        self.randomize_button.setEnabled(not busy)
+        self._update_actions()
+
+    def _failed(self, message):
+        self.statusBar().showMessage(message)
+        QtWidgets.QMessageBox.warning(self, 'Event Filtering', message)
+        self._update_actions()
+
+    def closeEvent(self, event):
+        if self.runner.busy or any(getattr(w, 'runner', None) and w.runner.busy for w in self.child_windows):
+            self.statusBar().showMessage('Please wait for the current operation to finish before closing.')
+            event.ignore()
+        else:
+            event.accept()
 
 
-def main() -> None:
-    root = tk.Tk()
-    DwellTApp(root)
-    root.mainloop()
+def main():
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
+    app.setApplicationName('Event Filtering')
+    app.setStyleSheet(APP_STYLE)
+    window = DwellTApp()
+    window.show()
+    if len(sys.argv) > 1:
+        QtCore.QTimer.singleShot(0, lambda: window.load_file(sys.argv[1]))
+    sys.exit(app.exec())
