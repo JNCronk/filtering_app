@@ -18,13 +18,13 @@ def test_start_timestamp_reference_preserves_recording_relative_times(app, recor
     wait_for(app, lambda: not window.runner.busy and window.preview_window is not None)
     results = window.active_segment_results
     for curve in window.summary.curves:
-        np.testing.assert_allclose(curve.xData, np.arange(1, 13))
+        np.testing.assert_allclose(curve.xData, np.arange(13))
     window.confirm_threshold()
     filtering = window.filter_window
     filtering.time_range.region.setRegion((3, 6))
     filtering.select_all()
-    assert filtering.selected_indices == {2, 3, 4, 5}
-    np.testing.assert_allclose(filtering.event_times, np.arange(1, 13))
+    assert filtering.selected_indices == {3, 4, 5, 6}
+    np.testing.assert_allclose(filtering.event_times, np.arange(13))
     for curve in window.summary.curves:
         np.testing.assert_allclose(curve.xData, filtering.event_times)
     assert window.summary.selected_segments == {'event_3', 'event_4', 'event_5', 'event_6'}
@@ -33,20 +33,20 @@ def test_start_timestamp_reference_preserves_recording_relative_times(app, recor
     output = tmp_path / 'selected.csv'
     write_selected_csv(output, [results[2]])
     with open(output) as handle:
-        assert float(next(csv.DictReader(handle))['timestamp']) == 103
-    with h5py.File(recording, 'r') as h5:
-        assert h5['events/event_0'].attrs['timestamp'] == 100
+        assert float(next(csv.DictReader(handle))['timestamp']) == 102
+    with h5py.File(recording.with_name('recording with spaces.h5'), 'r') as h5:
+        assert h5.attrs['recording_start_time_s'] == 100
     assert not errors
     window.close()
 
 
 def test_reference_labels_missing_start_timestamp_after_reload(app, recording, monkeypatch):
     window, errors = load(app, recording, monkeypatch)
-    with h5py.File(recording, 'a') as h5:
-        del h5['events/event_0'].attrs['timestamp']
+    with h5py.File(recording.with_name('recording with spaces.h5'), 'a') as h5:
+        del h5.attrs['recording_start_time_s']
     window.load_file(str(recording))
     wait_for(app, lambda: window.source is not None and not window.runner.busy)
-    assert window.source.time_origin == 101
-    assert window.recording_start_label.text() == 'No synthetic event found. First event 101.000000 s after acquisition started.'
+    assert window.source.time_origin == 100
+    assert window.recording_start_label.text() == 'Recording-start attribute unavailable. First event 100.000000 s after acquisition started.'
     assert not errors
     window.close()

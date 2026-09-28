@@ -43,6 +43,8 @@ from datetime import datetime, timezone
 
 def derive_ao_path(event_path: str) -> str:
     base, ext = os.path.splitext(os.path.abspath(event_path))
+    if base.casefold().endswith("_events"):
+        base = base[:-7]
     return base + "_AO" + ext if not base.endswith("_AO") else base + ext
 
 
@@ -128,7 +130,7 @@ def ensure_outdir(event_path: str) -> str:
     return out_dir
 
 
-def write_group(events_h5_path: str, events: list, ev_group: h5py.Group, volts_label: float, out_dir: str):
+def write_group(events_h5_path: str, events: list, source_h5: h5py.File, ev_group: h5py.Group, volts_label: float, out_dir: str):
     """Write a new H5 with these events (reindexed), preserving timestamps."""
     if len(events) < MIN_EVENTS:
         return None
@@ -138,12 +140,16 @@ def write_group(events_h5_path: str, events: list, ev_group: h5py.Group, volts_l
     out_path = os.path.join(out_dir, out_name)
 
     with h5py.File(out_path, "w") as g:
+        for key, value in source_h5.attrs.items():
+            g.attrs[key] = value
         g.attrs["source_file"] = os.path.abspath(events_h5_path)
         g.attrs["split_voltage_V"] = float(volts_label)
         # timezone-aware UTC (no deprecation warning)
         g.attrs["created_utc"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
         out_grp = g.create_group("events")
+        for key, value in ev_group.attrs.items():
+            out_grp.attrs[key] = value
         for idx, (name, ts) in enumerate(events):
             src = ev_group[name]
             data = src[()]  # event waveform
@@ -181,9 +187,6 @@ def main():
             print("No events found; nothing to split.")
             return
 
-        # PEINCon prepends a synthetic "start" event; include it in every output
-        anchor_event = ev_list[0]
-
         # Classify events by quantized volts
         groups = {}  # bin_idx -> [(name, ts), ...]
         for name, ts in ev_list:
@@ -200,15 +203,8 @@ def main():
             )
             if len(groups[bin_idx]) < MIN_EVENTS:
                 continue
-            seen = set()
-            events_for_file = []
-            for name_ts in [anchor_event] + groups[bin_idx]:
-                name = name_ts[0]
-                if name in seen:
-                    continue
-                seen.add(name)
-                events_for_file.append(name_ts)
-            path = write_group(EVENT_H5_PATH, events_for_file, ev_grp, v_label, outdir)
+            events_for_file = groups[bin_idx]
+            path = write_group(EVENT_H5_PATH, events_for_file, f_ev, ev_grp, v_label, outdir)
             if path:
                 written.append((v_label, len(events_for_file), path))
 

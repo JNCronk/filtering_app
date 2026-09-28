@@ -12,9 +12,10 @@ import pytest
 
 @pytest.fixture
 def recording(tmp_path):
-    path = tmp_path / 'recording with spaces.h5'
+    path = tmp_path / 'recording with spaces_Events.h5'
     with h5py.File(path, 'w') as h5:
         h5.attrs['instrument'] = 'test recorder'
+        h5.attrs['sampling_rate_hz'] = 50_000.0
         events = h5.create_group('events')
         events.attrs['units'] = 'nA'
         for i in range(13):
@@ -24,6 +25,9 @@ def recording(tmp_path):
             ds = events.create_dataset(f'event_{i}', data=data)
             ds.attrs['timestamp'] = 100.0 + i
             ds.attrs['calibration'] = 'preserve me'
+    with h5py.File(tmp_path / 'recording with spaces.h5', 'w') as h5:
+        h5.attrs['recording_start_time_s'] = 100.0
+        h5.attrs['sampling_rate_hz'] = 50_000.0
     with h5py.File(tmp_path / 'recording with spaces_AO.h5', 'w') as h5:
         h5.create_dataset('data', data=np.array([(100000., -0.5), (107000., -1.0)],
                                              dtype=[('timestamp', 'f8'), ('ao_value', 'f8')]))

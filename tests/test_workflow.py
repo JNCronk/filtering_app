@@ -34,10 +34,10 @@ def settings(path, **kwargs):
 def test_raw_voltage_splits_and_metadata(recording):
     with patch.object(analysis, 'analyze_event', side_effect=AssertionError('Must not detect on load')):
         source = inspect_file(str(recording))
-        assert source.event_names == [f'event_{i}' for i in range(1, 13)]
+        assert source.event_names == [f'event_{i}' for i in range(13)]
         assert all(not preview.segments for preview in source.previews)
         prepare_voltage_groups(source)
-    assert source.voltage_groups[-500] == [f'event_{i}' for i in range(1, 7)]
+    assert source.voltage_groups[-500] == [f'event_{i}' for i in range(7)]
     assert source.voltage_groups[-1000] == [f'event_{i}' for i in range(7, 13)]
     assert source.split_paths == []
     assert not (recording.parent / 'split_by_voltage').exists()
@@ -45,11 +45,11 @@ def test_raw_voltage_splits_and_metadata(recording):
     assert len(source.split_paths) == 2
     for path in source.split_paths:
         with h5py.File(path, 'r') as h5:
-            assert len(h5['events']) == 7
+            assert len(h5['events']) in (6, 7)
             assert h5.attrs['instrument'] == 'test recorder'
+            assert h5.attrs['recording_start_time_s'] == 100
             assert h5['events'].attrs['units'] == 'nA'
-            assert h5['events/event_00000'].attrs['source_event_name'] == 'event_0'
-            assert h5['events/event_00001'].attrs['calibration'] == 'preserve me'
+            assert h5['events/event_00000'].attrs['calibration'] == 'preserve me'
     previous = {p: Path(p).read_bytes() for p in source.split_paths}
     again = prepare_voltage_groups(inspect_file(str(recording)))
     again.split_paths = write_voltage_splits(again, {-500})
@@ -58,8 +58,24 @@ def test_raw_voltage_splits_and_metadata(recording):
     assert all(Path(p).read_bytes() == data for p, data in previous.items())
 
 
+def test_legacy_empty_start_event_is_excluded(tmp_path):
+    path = tmp_path / 'legacy.h5'
+    with h5py.File(path, 'w') as h5:
+        events = h5.create_group('events')
+        start = events.create_dataset('event_00000', data=np.array([], dtype=float))
+        start.attrs['timestamp'] = 25.0
+        event = events.create_dataset('event_00001', data=np.ones(32))
+        event.attrs['timestamp'] = 26.0
+
+    source = inspect_file(str(path))
+
+    assert source.event_names == ['event_00001']
+    assert source.recording_start_time_s == 25.0
+    assert source.time_origin == 25.0
+
+
 def test_missing_and_invalid_ao(recording):
-    ao = recording.with_name(recording.stem + '_AO.h5')
+    ao = recording.with_name(recording.stem.removesuffix('_Events') + '_AO.h5')
     ao.unlink()
     source = prepare_voltage_groups(inspect_file(str(recording)))
     assert 'could be found' in source.voltage_message
@@ -92,7 +108,7 @@ def test_selected_voltage_metrics_and_empty_results(recording):
     events = analysis.iter_detected_events(options)
     assert [event.event_name for event in events] == source.voltage_groups[-500]
     results = analysis.collect_segment_results(options, events)
-    assert len(results) == 6
+    assert len(results) == 7
     assert all(row.voltage_mV == -500 and row.resistance_MOhm == 250 for row in results)
     manual = analysis.collect_segment_results(replace(options, event_voltages_mV={}, voltage_mV=-200), events)
     assert all(row.resistance_MOhm == 100 for row in manual)
@@ -141,10 +157,11 @@ def test_exports_preserve_voltage_and_source(recording, tmp_path):
     output = tmp_path / 'selected.h5'
     write_selected_h5(output, options, rows, names)
     with h5py.File(output, 'r') as h5:
-        assert len(h5['events']) == 3
-        assert h5['events/event_00001'].attrs['source_event_name'] == rows[0].event_name
-        assert h5['events/event_00001'].attrs['voltage_mV'] == -1000
-        assert h5['events/event_00001'].attrs['start'] == rows[0].start
+        assert len(h5['events']) == 2
+        assert h5.attrs['recording_start_time_s'] == 100
+        assert h5['events/event_00000'].attrs['source_event_name'] == rows[0].event_name
+        assert h5['events/event_00000'].attrs['voltage_mV'] == -1000
+        assert h5['events/event_00000'].attrs['start'] == rows[0].start
     with pytest.raises(ValueError, match='overwritten'):
         write_selected_h5(recording, options, rows, names)
 
@@ -174,25 +191,25 @@ def test_qt_drop_preview_analysis_and_selection(app, recording, monkeypatch):
     assert not window.manual_voltage.isChecked()
     window.voltage_list.item(0).setCheckState(QtCore.Qt.CheckState.Unchecked)
     wait_for(app, lambda: not window.runner.busy)
-    assert window.selected_names() == [f'event_{i}' for i in range(1, 7)]
+    assert window.selected_names() == [f'event_{i}' for i in range(7)]
     window.run_analysis(window.show_segment_preview)
     wait_for(app, lambda: window.preview_window is not None and not window.runner.busy)
-    assert len(window.active_segment_results) == 6
+    assert len(window.active_segment_results) == 7
     assert not errors
     assert window.preview_window.isVisible()
-    assert len(window.summary.timelines[0].listDataItems()[0].xData) == 6
-    np.testing.assert_array_equal(window.summary.timelines[0].listDataItems()[0].xData, np.arange(1, 7))
+    assert len(window.summary.timelines[0].listDataItems()[0].xData) == 7
+    np.testing.assert_array_equal(window.summary.timelines[0].listDataItems()[0].xData, np.arange(7))
     window.grab().save('/tmp/filtering-ui-analysis.png')
     window.preview_window.grab().save('/tmp/filtering-segments.png')
     filtered = SegmentFilterWindow(window, window.active_settings, window.active_detected_events, window.active_segment_results)
     filtered.show()
     filtered.select_all()
-    assert len(filtered.selected_indices) == 6
+    assert len(filtered.selected_indices) == 7
     filtered.clear_selection()
     xs = np.array([r.dwell_time_ms for r in window.active_segment_results])
     ys = np.array([r.area_nA_ms for r in window.active_segment_results])
     filtered.on_select(QtCore.QRectF(0, 0, 100, 100), xs, ys)
-    assert len(filtered.selected_indices) == 6
+    assert len(filtered.selected_indices) == 7
     filtered.mode.setCurrentText('Remove')
     filtered.on_select(QtCore.QRectF(0, 0, 100, 100), xs, ys)
     assert not filtered.selected_indices
@@ -215,7 +232,7 @@ def test_qt_drop_preview_analysis_and_selection(app, recording, monkeypatch):
     window.active_segment_results = []
     window.run_analysis(force=True)
     wait_for(app, lambda: not window.runner.busy)
-    assert len(window.active_segment_results) == 6
+    assert len(window.active_segment_results) == 7
     window.fields['threshold_nA'].setValue(0.2)
     assert window.active_settings is None and not window.filter_button.isEnabled()
     window.voltage_list.item(1).setCheckState(QtCore.Qt.CheckState.Unchecked)
@@ -230,7 +247,7 @@ def test_qt_drop_preview_analysis_and_selection(app, recording, monkeypatch):
 
 def test_qt_missing_ao_manual(app, recording, monkeypatch):
     monkeypatch.setattr(QtWidgets.QMessageBox, 'warning', lambda *args: pytest.fail(str(args[-1])))
-    recording.with_name(recording.stem + '_AO.h5').unlink()
+    recording.with_name(recording.stem.removesuffix('_Events') + '_AO.h5').unlink()
     window = DwellTApp()
     window.path_field.setText(str(recording))
     window._load_pasted_path()

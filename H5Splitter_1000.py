@@ -6,10 +6,8 @@
 Split a PEINCon "event mode" HDF5 into files containing at most 1,000
 recorded events, in their original event-number order.
 
-PEINCon event files contain a synthetic "start" event as their first
-dataset.  That dataset is copied to the beginning of every output file so
-each chunk can be opened independently by the filtering app.  It is not
-counted toward EVENTS_PER_FILE.
+Recording-start time and sampling rate are stored as file attributes. Legacy
+zero-length synthetic start datasets are recognised and omitted from output.
 
 Usage:
     1. Edit EVENT_H5_PATH below and run this file, or
@@ -57,6 +55,42 @@ def list_events(events_group: h5py.Group) -> list[str]:
     return sorted(names, key=event_order_key)
 
 
+def partition_event_names(events_group: h5py.Group) -> tuple[str | None, list[str]]:
+    """Return an optional legacy empty anchor and all genuine event names."""
+    names = list_events(events_group)
+    if names and events_group[names[0]].size == 0:
+        return names[0], names[1:]
+    return None, names
+
+
+def recording_start_time(source_h5: h5py.File, events_group: h5py.Group) -> float | None:
+    """Read the start attribute, falling back to a legacy empty anchor."""
+    value = source_h5.attrs.get("recording_start_time_s")
+    if value is not None:
+        value = float(value)
+        if value == value and abs(value) != float("inf"):
+            return value
+    anchor, _ = partition_event_names(events_group)
+    if anchor is not None:
+        value = events_group[anchor].attrs.get("timestamp")
+        if value is not None:
+            value = float(value)
+            if value == value and abs(value) != float("inf"):
+                return value
+    source_path = os.path.abspath(source_h5.filename)
+    base, extension = os.path.splitext(source_path)
+    if base.casefold().endswith("_events"):
+        companion = base[:-7] + extension
+        if os.path.isfile(companion):
+            with h5py.File(companion, "r") as continuous_h5:
+                value = continuous_h5.attrs.get("recording_start_time_s")
+                if value is not None:
+                    value = float(value)
+                    if value == value and abs(value) != float("inf"):
+                        return value
+    return None
+
+
 def ensure_output_dir(event_path: str) -> str:
     base_dir = os.path.dirname(os.path.abspath(event_path))
     output_dir = os.path.join(base_dir, OUTPUT_DIR_NAME)
@@ -101,12 +135,11 @@ def write_chunk(
     source_group: h5py.Group,
     event_path: str,
     output_dir: str,
-    start_event: str,
     chunk_events: list[str],
     chunk_number: int,
     first_event_number: int,
 ) -> str:
-    """Write the synthetic start event followed by one ordered event chunk."""
+    """Write one ordered event chunk with recording metadata."""
     base, extension = os.path.splitext(os.path.basename(event_path))
     last_event_number = first_event_number + len(chunk_events) - 1
     output_name = (
@@ -121,14 +154,16 @@ def write_chunk(
         output_h5.attrs["split_chunk_number"] = chunk_number
         output_h5.attrs["events_in_chunk"] = len(chunk_events)
         output_h5.attrs["events_per_file"] = EVENTS_PER_FILE
+        start_time = recording_start_time(source_h5, source_group)
+        if start_time is not None:
+            output_h5.attrs["recording_start_time_s"] = start_time
         output_h5.attrs["created_utc"] = (
             datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         )
 
         output_group = output_h5.create_group("events", track_order=True)
         copy_attributes(source_group, output_group)
-        copy_event(source_group, output_group, start_event, 0)
-        for output_index, source_name in enumerate(chunk_events, start=1):
+        for output_index, source_name in enumerate(chunk_events):
             copy_event(source_group, output_group, source_name, output_index)
 
     return output_path
@@ -153,12 +188,9 @@ def split_file(event_path: str) -> list[str]:
             )
 
         source_group = source_h5["events"]
-        ordered_events = list_events(source_group)
-        if not ordered_events:
+        _, recorded_events = partition_event_names(source_group)
+        if not recorded_events:
             return written_paths
-
-        start_event = ordered_events[0]
-        recorded_events = ordered_events[1:]
 
         for offset in range(0, len(recorded_events), EVENTS_PER_FILE):
             chunk_events = recorded_events[offset : offset + EVENTS_PER_FILE]
@@ -167,7 +199,6 @@ def split_file(event_path: str) -> list[str]:
                 source_group=source_group,
                 event_path=event_path,
                 output_dir=output_dir,
-                start_event=start_event,
                 chunk_events=chunk_events,
                 chunk_number=(offset // EVENTS_PER_FILE) + 1,
                 first_event_number=offset + 1,

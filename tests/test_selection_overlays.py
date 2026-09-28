@@ -75,11 +75,11 @@ def test_time_slider_gates_selection_and_updates_main_overlays(app, recording, m
     filtering = window.filter_window
     assert window.summary.selected_segments == set()
     filtering.select_all()
-    assert len(filtering.selected_indices) == 12
+    assert len(filtering.selected_indices) == 13
     # The window uses seconds since the same recording start as the main plots.
-    np.testing.assert_array_equal(filtering.event_times, np.arange(1, 13))
+    np.testing.assert_array_equal(filtering.event_times, np.arange(13))
     filtering.time_range.region.setRegion((3, 6))
-    assert filtering.selected_indices == {2, 3, 4, 5}
+    assert filtering.selected_indices == {3, 4, 5, 6}
     for entry in window.summary.histogram_data:
         assert entry[1].opts['width'].sum() == 4
     assert window.selected_segment_names == {'event_3', 'event_4', 'event_5', 'event_6'}
@@ -91,16 +91,16 @@ def test_time_slider_gates_selection_and_updates_main_overlays(app, recording, m
     xs = np.array([row.dwell_time_ms for row in filtering.segment_results])
     ys = np.array([row.area_nA_ms for row in filtering.segment_results])
     filtering.on_select(QtCore.QRectF(0, 0, 1000, 1000), xs, ys)
-    assert filtering.selected_indices == {2, 3, 4, 5}
+    assert filtering.selected_indices == {3, 4, 5, 6}
     # Both numeric bounds and slider handles update the same selection constraint.
     filtering.time_range.start.setValue(5)
-    assert filtering.selected_indices == {4, 5}
+    assert filtering.selected_indices == {5, 6}
     filtering.time_range.end.setValue(5)
-    assert filtering.selected_indices == {4}
+    assert filtering.selected_indices == {5}
     filtering.time_range.reset_button.click()
-    assert filtering.selected_indices == {4}  # Widening does not silently select more.
+    assert filtering.selected_indices == {5}  # Widening does not silently select more.
     filtering.select_all()
-    assert len(filtering.selected_indices) == 12
+    assert len(filtering.selected_indices) == 13
     for scatter, _ in filtering.collections:
         assert all(0 < spot.brush().color().alpha() < 255 for spot in scatter.points())
     filtering.time_range.region.setRegion((3, 6))

@@ -10,7 +10,7 @@ from scipy.ndimage import gaussian_filter1d
 from scipy.signal import find_peaks
 from scipy.integrate import trapezoid
 
-from .H5Splitter_1000 import list_events
+from .H5Splitter_1000 import partition_event_names
 
 
 DEFAULT_H5 = ""
@@ -430,11 +430,10 @@ def list_event_names(filepath: str) -> tuple[str | None, list[str]]:
     with h5py.File(filepath, "r") as h5:
         if "events" not in h5:
             raise ValueError("No 'events' group found in file.")
-        event_names = list_events(h5["events"])
+        legacy_anchor, event_names = partition_event_names(h5["events"])
     if not event_names:
         raise ValueError("No events datasets found in the 'events' group.")
-    first_event = event_names[0]
-    return first_event, event_names[1:]
+    return legacy_anchor, event_names
 
 
 def load_previews_from_events(
@@ -480,12 +479,9 @@ def iter_detected_events(settings: Settings) -> list[DetectedEvent]:
             raise ValueError("No 'events' group found in file.")
 
         events_grp = h5["events"]
-        event_names = list_events(events_grp)
+        _, event_names = partition_event_names(events_grp)
         wanted = set(settings.event_names) if settings.event_names is not None else None
-        for idx, event_name in enumerate(event_names):
-            if idx == 0:
-                continue
-
+        for event_name in event_names:
             if wanted is not None and event_name not in wanted:
                 continue
 
@@ -503,7 +499,7 @@ def iter_detected_events(settings: Settings) -> list[DetectedEvent]:
                 )
             )
     adjacent_pairs = {
-        (left, right) for left, right in zip(event_names[1:], event_names[2:])
+        (left, right) for left, right in zip(event_names, event_names[1:])
         if settings.event_voltages_mV.get(left, settings.voltage_mV)
         == settings.event_voltages_mV.get(right, settings.voltage_mV)
     }

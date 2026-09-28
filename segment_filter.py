@@ -11,7 +11,7 @@ import numpy as np
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtWidgets
 
-from .H5Splitter_1000 import list_events
+from .H5Splitter_1000 import recording_start_time
 from .dwell_t import EventPreview
 from .plots import SelectionViewBox, draw_trace, scatter_brush, style_plot
 from .qt_helpers import button, number_field
@@ -42,10 +42,10 @@ def write_selected_h5(path, settings, rows, base_event_names):
             events = dst.create_group('events', track_order=True)
             for key, value in src['events'].attrs.items():
                 events.attrs[key] = value
-            names = list_events(src['events'])
-            if names:
-                src.copy(src['events'][names[0]], events, name='event_00000')
-            for index, row in enumerate(rows, start=1):
+            start_time = recording_start_time(src, src['events'])
+            if start_time is not None:
+                dst.attrs['recording_start_time_s'] = start_time
+            for index, row in enumerate(rows):
                 name = base_event_names[row.event_name]
                 output_name = f'event_{index:05d}'
                 src.copy(src['events'][name], events, name=output_name)

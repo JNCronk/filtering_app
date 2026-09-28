@@ -7,7 +7,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-from .H5Splitter_1000 import list_events
+from .H5Splitter_1000 import partition_event_names, recording_start_time
 from .H5Splitter_volt import load_ao, volts_to_safe_suffix
 from .dwell_t import EventPreview, PREVIEW_COUNT
 
@@ -15,11 +15,12 @@ from .dwell_t import EventPreview, PREVIEW_COUNT
 @dataclass
 class EventSource:
     filepath: str
-    anchor: str
     event_names: list[str]
     timestamps: dict[str, float | None]
     previews: list[EventPreview]
     time_origin: float
+    recording_start_time_s: float | None = None
+    sampling_rate_hz: float | None = None
     voltage_groups: dict[float, list[str]] = field(default_factory=dict)
     event_voltages_mV: dict[str, float] = field(default_factory=dict)
     ao_path: str | None = None
@@ -52,22 +53,50 @@ def inspect_file(filepath: str) -> EventSource:
     with h5py.File(path, "r") as h5:
         if "events" not in h5 or not isinstance(h5["events"], h5py.Group):
             raise ValueError("The H5 file must contain an 'events' group.")
-        names = list_events(h5["events"])
+        _, names = partition_event_names(h5["events"])
         if not names:
-            raise ValueError("No event datasets found.")
+            raise ValueError("No recorded event datasets found.")
         timestamps = {name: timestamp_of(h5["events"][name]) for name in names}
+        start_time = recording_start_time(h5, h5["events"])
+        sample_rate = finite_attribute(h5, "sampling_rate_hz")
+    companion = find_continuous_path(path)
+    if companion is not None and (start_time is None or sample_rate is None):
+        with h5py.File(companion, "r") as h5:
+            if start_time is None:
+                start_time = finite_attribute(h5, "recording_start_time_s")
+            if sample_rate is None:
+                sample_rate = finite_attribute(h5, "sampling_rate_hz")
     valid_times = [t for t in timestamps.values() if t is not None]
-    origin = timestamps[names[0]]
-    if origin is None:
-        origin = min(valid_times, default=0.0)
-    return EventSource(str(path), names[0], names[1:], timestamps,
-                       read_raw_previews(str(path), names[1:PREVIEW_COUNT + 1]), origin)
+    origin = start_time if start_time is not None else min(valid_times, default=0.0)
+    return EventSource(str(path), names, timestamps,
+                       read_raw_previews(str(path), names[:PREVIEW_COUNT]), origin,
+                       start_time, sample_rate)
+
+
+def finite_attribute(h5: h5py.File, name: str) -> float | None:
+    value = h5.attrs.get(name)
+    if value is None:
+        return None
+    value = float(value)
+    return value if np.isfinite(value) else None
+
+
+def recording_stem(path: Path) -> str:
+    return path.stem[:-7] if path.stem.casefold().endswith("_events") else path.stem
+
+
+def find_continuous_path(filepath: str | Path) -> Path | None:
+    path = Path(filepath)
+    if not path.stem.casefold().endswith("_events"):
+        return None
+    candidate = path.with_name(recording_stem(path) + path.suffix)
+    return candidate if candidate.is_file() else None
 
 
 def find_ao_path(filepath: str) -> Path | None:
     path = Path(filepath)
     # Match only the recording's companion, never an unrelated AO log.
-    stem = (path.stem + "_AO").casefold()
+    stem = (recording_stem(path) + "_AO").casefold()
     candidates = sorted(p for p in path.parent.iterdir()
                         if p.is_file() and p.stem.casefold() == stem
                         and p.suffix.casefold() in {".h5", ".hdf5"})
@@ -132,12 +161,16 @@ def write_voltage_splits(source: EventSource, voltages=None, output_dir=None) ->
                 with dst:
                     for key, value in src.attrs.items():
                         dst.attrs[key] = value
+                    if source.recording_start_time_s is not None:
+                        dst.attrs["recording_start_time_s"] = source.recording_start_time_s
+                    if source.sampling_rate_hz is not None:
+                        dst.attrs["sampling_rate_hz"] = source.sampling_rate_hz
                     dst.attrs["source_file"] = source.filepath
                     dst.attrs["split_voltage_V"] = voltage / 1000
                     group = dst.create_group("events", track_order=True)
                     for key, value in src["events"].attrs.items():
                         group.attrs[key] = value
-                    for index, name in enumerate([source.anchor, *names]):
+                    for index, name in enumerate(names):
                         output_name = f"event_{index:05d}"
                         src.copy(src["events"][name], group, name=output_name)
                         group[output_name].attrs["source_event_name"] = name

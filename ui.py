@@ -211,7 +211,7 @@ class DwellTApp(QtWidgets.QMainWindow):
         right_layout.addWidget(self.summary_label)
         self.recording_start_label = QtWidgets.QLabel('Recording started — s after acquisition.')
         self.recording_start_label.setWordWrap(True)
-        self.recording_start_label.setToolTip('Timestamp of the synthetic start event, in seconds.')
+        self.recording_start_label.setToolTip('The recording_start_time_s file attribute, in seconds after acquisition start.')
         right_layout.addWidget(self.recording_start_label)
         explanation = QtWidgets.QLabel('Click or box-select time points to preview events; Shift/⌘/Ctrl adds events. Lighter dots are previewed. Each pair shares a value axis, initially showing the central 99%.')
         explanation.setWordWrap(True)
@@ -290,15 +290,21 @@ class DwellTApp(QtWidgets.QMainWindow):
 
     def _file_loaded(self, source):
         self.source = source
-        timestamp = source.timestamps.get(source.anchor)
-        if timestamp is None:
+        if source.sampling_rate_hz is not None and source.sampling_rate_hz > 0:
+            field = self.fields['samp_freq']
+            field.blockSignals(True)
+            field.setValue(source.sampling_rate_hz / 1000.0)
+            field.blockSignals(False)
+        if source.recording_start_time_s is None:
             valid_times = [value for value in source.timestamps.values() if value is not None]
             first_time = f'{min(valid_times):.6f}' if valid_times else 'unknown'
             self.recording_start_label.setText(
-                f'No synthetic event found. First event {first_time} s after acquisition started.'
+                f'Recording-start attribute unavailable. First event {first_time} s after acquisition started.'
             )
         else:
-            self.recording_start_label.setText(f'Recording started {timestamp:.6f} s after acquisition.')
+            self.recording_start_label.setText(
+                f'Recording started {source.recording_start_time_s:.6f} s after acquisition.'
+            )
         self.preview_order_names = list(source.event_names)
         self._display_raw(source.previews)
         self.statusBar().showMessage('Raw events loaded. Checking AO voltages…')
@@ -319,7 +325,7 @@ class DwellTApp(QtWidgets.QMainWindow):
         self.voltage_list.setVisible(bool(source.voltage_groups))
         self.manual_voltage.setEnabled(bool(source.voltage_groups))
         self.voltage_field.setEnabled(self.manual_voltage.isChecked())
-        self.statusBar().showMessage(f'{len(source.event_names)} raw events loaded. Synthetic start event excluded. No segment detection has run.')
+        self.statusBar().showMessage(f'{len(source.event_names)} raw events loaded. No segment detection has run.')
         self._rebuild_preview_order()
         self._refresh_raw()
         self._update_actions()

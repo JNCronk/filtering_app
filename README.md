@@ -29,14 +29,14 @@ python main.py "/path/to/recording.h5"
 
 Drag one `.h5` or `.hdf5` event file from Finder anywhere onto the app (including the path field and plots), use **Browse**, or paste its path. Local file URLs and paths containing spaces are supported. Loading runs in the background and immediately displays unprocessed event traces, before segment detection. Use **Previous** and **Next** to browse six raw events at a time.
 
-The input must contain an `events` group of one-dimensional current datasets. Dataset names are sorted in numeric event order. The first dataset is treated as the synthetic start event and excluded from previews and analysis.
+The input must contain an `events` group of one-dimensional current datasets. Dataset names are sorted in numeric event order, and every genuine event is included in previews and analysis. Recording start is read from the `recording_start_time_s` file attribute; for acquisition files named `*_Events.h5`, the app also checks the companion continuous file. `sampling_rate_hz` automatically populates the sampling-frequency control. Legacy zero-length synthetic start datasets are recognised and excluded.
 
 The app looks beside the input for a matching `<recording>_AO.h5` or `.hdf5` file (case-insensitive). Its `data` dataset must have `timestamp` and `ao_value` fields, as in `H5Splitter_volt.py`:
 
 - AO timestamps are milliseconds; event `timestamp` attributes are seconds.
 - Each event receives the last AO value at or before its timestamp, rounded to 1 mV. Before the first AO entry, the splitter convention is 0 V.
 - Voltage grouping happens in memory; loading a recording creates no new files.
-- **Save selected voltages…** lets you choose a destination folder and writes one H5 per checked voltage, with the synthetic start event, reindexed event names, source names, timestamps, and original metadata.
+- **Save selected voltages…** lets you choose a destination folder and writes one H5 per checked voltage, with recording metadata, reindexed event names, source names, timestamps, and original metadata.
 - Existing split files are preserved; repeated saves get numbered output filenames. Saving uses the recorded AO groups even when manual voltage is enabled for resistance calculations.
 - Check the voltages to include in raw browsing and downstream analysis. All are initially checked. Resistance uses each event's assigned voltage.
 - **Use manual voltage** overrides the AO-derived voltage for resistance calculations; voltage checkboxes still determine which events to include.
@@ -130,7 +130,7 @@ Histograms are horizontal: count is on x and the physical parameter is on y. Eac
 
 Histograms show the central 99% of finite values, trimming up to 0.5% from each tail using observed ranks. Small samples and ties may retain more than 99%. Constant-valued data gets a padded range. Adaptive bin counts are capped at 120. Each histogram’s tooltip reports how many values are outside its initial displayed range.
 
-These display limits do not remove segments or change selection/export data. Time plots retain all finite metric values with valid timestamps and share the time axis. Each histogram/time pair initially uses the central-99% value range; pan or zoom the shared y axis to inspect time-plot outliers. The x coordinate is the event timestamp minus the synthetic start timestamp (or the earliest available timestamp if the start timestamp is missing), in seconds. Events without timestamps remain in the full histograms; time-plot tooltips report their omitted count.
+These display limits do not remove segments or change selection/export data. Time plots retain all finite metric values with valid timestamps and share the time axis. Each histogram/time pair initially uses the central-99% value range; pan or zoom the shared y axis to inspect time-plot outliers. The x coordinate is the event timestamp minus `recording_start_time_s` (or the earliest available timestamp if the attribute is unavailable), in seconds. Events without timestamps remain in the full histograms; time-plot tooltips report their omitted count.
 
 ## Vibration Removal
 
@@ -215,11 +215,11 @@ The saved CSV includes:
 - `resistance_MOhm`
 - `voltage_mV`
 
-The filtered H5 contains the synthetic start event and one full source trace per selected segment. Datasets are reindexed and preserve original attributes, source event/segment names, segment bounds, metrics, and applied voltage. Selecting the input file as the export destination is rejected.
+The filtered H5 contains one full source trace per selected segment and preserves recording metadata. Datasets are reindexed and preserve original attributes, source event/segment names, segment bounds, metrics, and applied voltage. Selecting the input file as the export destination is rejected.
 
 ## Verification
 
-Run the synthetic-file and offscreen Qt integration tests with:
+Run the HDF5 and offscreen Qt integration tests with:
 
 ```bash
 python -m pip install pytest
